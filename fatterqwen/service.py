@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import queue
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 import numpy as np
 
@@ -20,6 +21,44 @@ from .prefetch_manifest import resolve_prefetched_model_path
 from .voice_registry import VoiceEntry, VoiceRegistry
 
 LOGGER = logging.getLogger(__name__)
+
+
+def build_supported_model_load_kwargs(
+    loader: Callable[..., object],
+    *,
+    device: str,
+    dtype: object,
+    local_files_only: bool,
+) -> dict[str, object]:
+    """Build a `from_pretrained` kwargs dictionary compatible with the current loader API.
+
+    Usage:
+        Runtime model loading calls this helper before invoking the vendored
+        `faster-qwen3-tts` loader so the wrapper stays compatible with restored or
+        upgraded copies whose `from_pretrained(...)` signature may or may not
+        accept optional Hugging Face-style keyword arguments such as
+        `local_files_only`.
+
+    Parameters:
+        loader: The callable whose signature should be inspected, usually
+            `FasterQwen3TTS.from_pretrained`.
+        device: The runtime device string that should be forwarded.
+        dtype: The resolved torch dtype object that should be forwarded.
+        local_files_only: Whether runtime would prefer stricter local-only model
+            resolution when the loader supports that hint.
+
+    Returns:
+        A dictionary containing only keyword arguments that the inspected loader
+        explicitly supports.
+    """
+    supported_parameters = inspect.signature(loader).parameters
+    load_kwargs: dict[str, object] = {
+        "device": device,
+        "dtype": dtype,
+    }
+    if "local_files_only" in supported_parameters:
+        load_kwargs["local_files_only"] = local_files_only
+    return load_kwargs
 
 
 @dataclass(frozen=True)
@@ -319,20 +358,24 @@ class TtsService:
                 "Offline mode is enabled, but no local snapshot path could be resolved for "
                 f"{self.model_id!r}. Check FATTERQWEN_PREFETCH_MANIFEST and the Hugging Face hub cache contents."
             )
-        LOGGER.info(
-            "Loading model %s from %s on device %s with dtype %s (local_files_only=%s)",
-            self.config.model,
-            model_source,
-            self.config.device,
-            self.config.dtype,
-            local_files_only,
-        )
-        self._model = FasterQwen3TTS.from_pretrained(
-            model_source,
+        load_kwargs = build_supported_model_load_kwargs(
+            FasterQwen3TTS.from_pretrained,
             device=self.config.device,
             dtype=dtype,
             local_files_only=local_files_only,
         )
+        if local_files_only and "local_files_only" not in load_kwargs:
+            LOGGER.info(
+                "Current faster-qwen3-tts loader does not accept local_files_only; relying on the resolved local model path and offline environment flags instead."
+            )
+        LOGGER.info(
+            "Loading model %s from %s on device %s with dtype %s",
+            self.config.model,
+            model_source,
+            self.config.device,
+            self.config.dtype,
+        )
+        self._model = FasterQwen3TTS.from_pretrained(model_source, **load_kwargs)
         LOGGER.info("Model ready with sample rate %s Hz", self._model.sample_rate)
 
     def _require_model(self):
