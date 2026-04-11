@@ -54,27 +54,33 @@ uv run fatterqwen \
   --wyoming-uri tcp://0.0.0.0:10300
 ```
 
-Useful environment variables mirror the CLI flags:
+CLI arguments take precedence, and environment variables act as fallbacks.
 
-- `FATTERQWEN_VOICES_DIR`
-- `FATTERQWEN_HOST`
-- `FATTERQWEN_PORT`
-- `FATTERQWEN_MODEL`
-- `FATTERQWEN_DEVICE`
-- `FATTERQWEN_DTYPE`
-- `FATTERQWEN_DEFAULT_LANGUAGE`
-- `FATTERQWEN_CHUNK_SIZE`
-- `FATTERQWEN_APPEND_SILENCE`
-- `FATTERQWEN_NON_STREAMING_MODE`
-- `FATTERQWEN_MAX_TEXT_LENGTH`
-- `FATTERQWEN_MODEL_CACHE_DIR`
-- `FATTERQWEN_PREFETCH_MANIFEST`
-- `FATTERQWEN_WARMUP`
-- `FATTERQWEN_WARMUP_TEXT`
-- `FATTERQWEN_WYOMING_URI`
-- `FATTERQWEN_WYOMING_ENABLED`
-- `FATTERQWEN_WYOMING_AUDIO_CHUNK_SAMPLES`
-- `FATTERQWEN_LOG_LEVEL`
+### Server configuration reference
+
+| CLI flag | ENV fallback | Default |
+| --- | --- | --- |
+| `--voices-dir` | `FATTERQWEN_VOICES_DIR` | `voices` |
+| `--host` | `FATTERQWEN_HOST` | `0.0.0.0` |
+| `--port` | `FATTERQWEN_PORT` | `8000` |
+| `--model` | `FATTERQWEN_MODEL` | `1.7B` |
+| `--device` | `FATTERQWEN_DEVICE` | `cuda` |
+| `--dtype` | `FATTERQWEN_DTYPE` | `bfloat16` |
+| `--default-language` | `FATTERQWEN_DEFAULT_LANGUAGE` | `Auto` |
+| `--chunk-size` | `FATTERQWEN_CHUNK_SIZE` | `8` |
+| `--append-silence` / `--no-append-silence` | `FATTERQWEN_APPEND_SILENCE` | `true` |
+| `--non-streaming-mode` / `--no-non-streaming-mode` | `FATTERQWEN_NON_STREAMING_MODE` | `false` |
+| `--max-text-length` | `FATTERQWEN_MAX_TEXT_LENGTH` | `4000` |
+| `--model-cache-dir` | `FATTERQWEN_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
+| `--prefetch-manifest` | `FATTERQWEN_PREFETCH_MANIFEST` | empty / unset |
+| `--warmup` / `--no-warmup` | `FATTERQWEN_WARMUP` | `false` |
+| `--warmup-text` | `FATTERQWEN_WARMUP_TEXT` | `Hello from fatterqwen.` |
+| `--wyoming-enabled` / `--no-wyoming-enabled` | `FATTERQWEN_WYOMING_ENABLED` | `true` |
+| `--wyoming-uri` | `FATTERQWEN_WYOMING_URI` | `tcp://0.0.0.0:10300` |
+| `--wyoming-audio-chunk-samples` | `FATTERQWEN_WYOMING_AUDIO_CHUNK_SAMPLES` | `4096` |
+| `--log-level` | `FATTERQWEN_LOG_LEVEL` | `INFO` |
+
+Boolean environment variables accept `1`, `true`, `yes`, or `on` for true, and `0`, `false`, `no`, or `off` for false.
 
 ## OpenAI-compatible API
 
@@ -114,6 +120,14 @@ Prefetch a model into the Hugging Face cache:
 ```bash
 uv run fatterqwen-prefetch --model 1.7B
 ```
+
+### Prefetch command reference
+
+| CLI flag | ENV fallback | Default |
+| --- | --- | --- |
+| `--model` | — | `1.7B` |
+| `--cache-dir` | `FATTERQWEN_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
+| `--manifest` | `FATTERQWEN_PREFETCH_MANIFEST` | empty / unset |
 
 When you pass `--cache-dir`, use the actual Hugging Face hub cache directory that `from_pretrained(...)` will read from. In the Docker image, that path is `/opt/huggingface/hub`.
 
