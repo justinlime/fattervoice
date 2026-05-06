@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -496,6 +497,193 @@ class LongformServiceTests(unittest.TestCase):
         self.assertEqual(sample_rate, 24000)
         self.assertGreater(waveform.shape[0], 0)
         self.assertGreater(len(service._model.generated_texts), 1)
+
+    def test_stream_pcm_chunks_rejects_invalid_requests_before_iteration(self) -> None:
+        """Ensure streaming validation runs before an async iterator is handed out.
+
+        Usage:
+            The HTTP adapter now relies on `TtsService.stream_pcm_chunks(...)` to
+            fail fast so it can return a normal 400 response before opening a
+            chunked response body.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that invalid text raises immediately when the
+            streaming iterator is requested.
+        """
+        voice_registry = Mock()
+        service = TtsService(self._build_config(), voice_registry)
+
+        with self.assertRaises(ValueError):
+            service.stream_pcm_chunks(
+                SynthesisRequest(
+                    text="   ",
+                    voice_id="demo",
+                )
+            )
+
+        voice_registry.get.assert_not_called()
+        service.close()
+
+    def test_stream_pcm_chunks_defers_voice_preparation_until_iteration(self) -> None:
+        """Ensure stream creation validates eagerly without preprocessing the voice yet.
+
+        Usage:
+            The HTTP adapter relies on immediate request validation, but voice
+            preparation should still be deferred until the client actually starts
+            consuming the streaming response.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that requesting the async iterator does not
+            yet call the voice-preparation helper.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voice_entry = self._build_voice_entry(temp_dir)
+            voice_registry = Mock()
+            voice_registry.get.return_value = voice_entry
+            service = TtsService(self._build_config(), voice_registry)
+
+            with patch.object(service, "_resolve_prepared_voice_conditioning") as prepare_voice:
+                stream = service.stream_pcm_chunks(
+                    SynthesisRequest(
+                        text="A short sentence.",
+                        voice_id="demo",
+                    )
+                )
+
+            self.assertIsNotNone(stream)
+            prepare_voice.assert_not_called()
+            asyncio.run(stream.aclose())
+            service.close()
+
+    def test_stream_pcm_chunks_closing_consumer_does_not_leave_producer_thread_stuck(self) -> None:
+        """Ensure early stream shutdown does not leave the producer thread blocked forever.
+
+        Usage:
+            Streaming clients can disconnect after receiving only part of the
+            response. This test verifies that the internal producer exits cleanly
+            even when bounded queue backpressure is present during shutdown.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that one chunk is received and the producer
+            thread terminates after the consumer closes the stream.
+        """
+        async def consume_one_chunk_and_close(service: TtsService) -> bytes:
+            """Read one PCM chunk and then close the stream to simulate disconnect.
+
+            Usage:
+                The shutdown regression only appears when the consumer stops
+                draining the async iterator early, so this helper closes the
+                stream immediately after the first yielded chunk.
+
+            Parameters:
+                service: The `TtsService` instance under test.
+
+            Returns:
+                The first PCM chunk yielded by the service.
+            """
+            stream = service.stream_pcm_chunks(
+                SynthesisRequest(
+                    text="A short sentence.",
+                    voice_id="demo",
+                )
+            )
+            first_chunk = await anext(stream)
+            await stream.aclose()
+            return first_chunk
+
+        def fast_pcm_chunk_iterator(*, request: SynthesisRequest, prepared_voice: PreparedVoiceConditioning):
+            """Yield many PCM chunks quickly so the internal queue can fill under backpressure.
+
+            Usage:
+                The service under test consumes this generator inside its
+                producer thread. A burst of chunks makes it much more likely that
+                the queue is full when the consumer disconnects.
+
+            Parameters:
+                request: The normalized request supplied by the service.
+                prepared_voice: The prepared conditioning bundle supplied by the service.
+
+            Returns:
+                A synchronous iterator of raw PCM byte chunks.
+            """
+            _ = request, prepared_voice
+            for _chunk_index in range(64):
+                yield b"\x00\x01" * 128
+
+        created_threads: list[threading.Thread] = []
+        real_thread_type = threading.Thread
+
+        def build_recording_thread(*args, **kwargs) -> threading.Thread:
+            """Create a real thread while recording the producer for shutdown assertions.
+
+            Usage:
+                The test patches `fatterqwen.service.threading.Thread` with this
+                helper so it can later join only the background synthesis
+                producer thread, without confusing it with executor worker
+                threads created elsewhere in the async stack.
+
+            Parameters:
+                *args: Positional arguments forwarded to `threading.Thread`.
+                **kwargs: Keyword arguments forwarded to `threading.Thread`.
+
+            Returns:
+                The created `threading.Thread` instance.
+            """
+            thread = real_thread_type(*args, **kwargs)
+            target = kwargs.get("target")
+            if callable(target) and getattr(target, "__name__", "") == "produce_streaming_audio":
+                created_threads.append(thread)
+            return thread
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voice_entry = self._build_voice_entry(temp_dir)
+            voice_registry = Mock()
+            voice_registry.get.return_value = voice_entry
+            service = TtsService(self._build_config(), voice_registry)
+            service._model = _FakeCloneModel()
+            prepared_voice = PreparedVoiceConditioning(
+                voice_id="demo",
+                audio_path=Path(temp_dir) / "prepared.wav",
+                transcript="Reference transcript.",
+                reference_rms=0.2,
+                prompt_rms=0.2,
+            )
+
+            with (
+                patch.object(
+                    service,
+                    "_resolve_prepared_voice_conditioning",
+                    return_value=prepared_voice,
+                ),
+                patch.object(
+                    service,
+                    "_plan_request_chunks",
+                    return_value=["A short sentence."],
+                ),
+                patch.object(
+                    service,
+                    "_stream_short_request_pcm_chunks",
+                    side_effect=fast_pcm_chunk_iterator,
+                ),
+                patch("fatterqwen.service.threading.Thread", side_effect=build_recording_thread),
+            ):
+                first_chunk = asyncio.run(consume_one_chunk_and_close(service))
+
+            service.close()
+
+        self.assertGreater(len(first_chunk), 0)
+        self.assertEqual(len(created_threads), 1)
+        created_threads[0].join(timeout=2.0)
+        self.assertFalse(created_threads[0].is_alive())
 
     def test_stream_pcm_chunks_uses_chunked_longform_path_without_upstream_streaming(self) -> None:
         """Ensure long-form streaming uses chunk-level synthesis rather than token streaming.

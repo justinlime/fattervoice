@@ -161,13 +161,6 @@ def create_openai_app(service: TtsService, voice_registry: VoiceRegistry, config
             language=request.language,
         )
 
-        try:
-            service.validate_request(synthesis_request)
-        except VoiceRegistryError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
         stream_response = (
             response_format in {"wav", "pcm"}
             if request.stream is None
@@ -175,6 +168,12 @@ def create_openai_app(service: TtsService, voice_registry: VoiceRegistry, config
         )
 
         if stream_response and response_format in {"wav", "pcm"}:
+            try:
+                pcm_chunk_stream = service.stream_pcm_chunks(synthesis_request)
+            except VoiceRegistryError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
             async def streamed_audio_body():
                 """Yield a streaming HTTP audio body using the shared synthesis service.
@@ -184,7 +183,7 @@ def create_openai_app(service: TtsService, voice_registry: VoiceRegistry, config
                     a WAV header (when needed) followed by model-produced PCM chunks.
 
                 Parameters:
-                    None. It closes over the validated request state.
+                    None. It closes over the prepared request state.
 
                 Returns:
                     An async byte stream suitable for chunked HTTP transfer.
@@ -192,7 +191,7 @@ def create_openai_app(service: TtsService, voice_registry: VoiceRegistry, config
                 try:
                     if response_format == "wav":
                         yield build_wav_header(service.sample_rate)
-                    async for pcm_chunk in service.stream_pcm_chunks(synthesis_request):
+                    async for pcm_chunk in pcm_chunk_stream:
                         yield pcm_chunk
                 except Exception:  # pragma: no cover - exercised during runtime integration.
                     LOGGER.exception("Unhandled streaming synthesis failure")

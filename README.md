@@ -165,14 +165,7 @@ uv run fatterqwen-prefetch \
 
 ## Docker
 
-The default Docker build targets a broadly compatible CUDA runtime stack:
-
-- base image family: official `nvidia/cuda`
-- default CUDA tag: `12.6.3-cudnn-*-ubuntu24.04`
-- default Python in the image: 3.12
-- PyTorch wheel index: `cu126`
-
-That keeps the stable CUDA 12.6 wheel flow from the upstream `faster-qwen3-tts` Docker reference, while moving the wrapper image to Ubuntu 24.04 so the build uses Python 3.11+ and avoids the current `onnxruntime` CPython 3.10 wheel gap.
+The default Docker build uses the same stable CUDA 12.6 wheel flow as the upstream `faster-qwen3-tts` project while running on Ubuntu 24.04 with Python 3.12.
 
 Build the image:
 
@@ -180,9 +173,7 @@ Build the image:
 docker build -t fatterqwen .
 ```
 
-By default, the Docker image now prefetches **both** supported built-in models (`0.6B` and `1.7B`). That means a normal image build can safely run later with either `FATTERQWEN_MODEL=0.6B` or `FATTERQWEN_MODEL=1.7B` while still staying offline at runtime.
-
-The Dockerfile is now single-stage and layered so that dependency installation and model prefetch happen before the frequently changing `fatterqwen/` application code is copied. That means ordinary Python logic edits should usually only invalidate the final lightweight install layer instead of forcing a full dependency and model rebuild. A `.dockerignore` file also keeps tests, voices, caches, and other non-runtime content out of the build context so Podman/Docker do less work before the first layer even starts. The build also writes `/opt/fatterqwen/prefetched-models.json`, allowing runtime startup to resolve exact local snapshot paths instead of relying only on cache discovery in offline mode.
+By default, the image prefetched **both** supported built-in models (`0.6B` and `1.7B`) during the build, so a finished image can stay offline at runtime while serving either model.
 
 Build a smaller single-model image instead:
 
@@ -192,7 +183,7 @@ docker build \
   -t fatterqwen:0.6b .
 ```
 
-Or explicitly build an image that prefetches both supported models:
+Or explicitly build an image that contains both supported models:
 
 ```bash
 docker build \
@@ -201,15 +192,6 @@ docker build \
 ```
 
 If you build a single-model offline image, keep the runtime model selection aligned with that build. For example, an image built with `MODEL_SELECTION=0.6B` should run with `FATTERQWEN_MODEL=0.6B` unless you rebuild it with `MODEL_SELECTION=all`.
-
-If you need Blackwell-oriented wheels, override the CUDA and PyTorch build arguments to a CUDA 12.8 stack:
-
-```bash
-docker build \
-  --build-arg CUDA_VERSION=12.8.1 \
-  --build-arg TORCH_CUDA_INDEX=cu128 \
-  -t fatterqwen:cu128 .
-```
 
 Run the container:
 

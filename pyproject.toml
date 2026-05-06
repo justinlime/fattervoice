@@ -6,7 +6,6 @@ build-backend = "hatchling.build"
 name = "fatterqwen"
 version = "0.1.0"
 description = "Production-oriented OpenAI-compatible and Wyoming TTS server for faster-qwen3-tts"
-readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "eca" }]

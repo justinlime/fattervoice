@@ -285,13 +285,15 @@ class TtsService:
 
         return await loop.run_in_executor(None, generate_full_audio)
 
-    async def stream_pcm_chunks(self, request: SynthesisRequest) -> AsyncIterator[bytes]:
+    def stream_pcm_chunks(self, request: SynthesisRequest) -> AsyncIterator[bytes]:
         """Yield PCM chunks as the model produces streaming audio for a request.
 
         Usage:
             The HTTP WAV/PCM endpoint and the Wyoming adapter call this method to
             forward low-latency audio without waiting for the entire utterance to
-            finish synthesizing.
+            finish synthesizing. Request validation runs immediately so protocol
+            adapters can reject bad input before opening a stream, while heavier
+            voice preparation still starts only when the iterator is consumed.
 
         Parameters:
             request: A normalized request describing the text, voice, and runtime
@@ -301,104 +303,125 @@ class TtsService:
             An async iterator that yields raw 16-bit PCM audio chunks.
         """
         voice = self.validate_request(request)
-        prepared_voice = self._resolve_prepared_voice_conditioning(voice)
-        text_chunks = self._plan_request_chunks(request.text)
-        item_queue: "queue.Queue[object]" = queue.Queue(maxsize=8)
-        finished_marker = object()
-        stop_event = threading.Event()
 
-        def push_queue_item(item: object, force: bool = False) -> bool:
-            """Push an item into the streaming queue while honoring cancellation.
+        async def consume_streaming_audio() -> AsyncIterator[bytes]:
+            """Prepare the voice, run background synthesis, and yield queued PCM.
 
             Usage:
-                The background producer uses this helper to provide bounded
-                backpressure and to stop cleanly when the async consumer has gone
-                away or cancelled the response.
-
-            Parameters:
-                item: The queue item to push.
-                force: When true, keep trying to deliver the item even if the stop
-                    flag has been set. This is used for the final completion marker.
-
-            Returns:
-                `True` when the item was queued successfully, otherwise `False`
-                when cancellation prevented delivery.
-            """
-            while True:
-                if stop_event.is_set() and not force:
-                    return False
-                try:
-                    item_queue.put(item, timeout=0.25)
-                    return True
-                except queue.Full:
-                    if stop_event.is_set() and not force:
-                        return False
-
-        def produce_streaming_audio() -> None:
-            """Run the selected streaming strategy inside a background thread.
-
-            Usage:
-                Short requests keep the vendored low-latency upstream streaming
-                path, while long-form chunked requests use chunk-level generation
-                and boundary smoothing before PCM bytes are queued.
+                The outer method performs eager request validation only, then
+                this nested generator handles voice preparation, worker-thread
+                orchestration, and queue draining once the caller actually starts
+                consuming the stream.
 
             Parameters:
                 None. It closes over the validated request state.
 
             Returns:
-                None. PCM chunks and terminal markers are delivered through the queue.
+                An async iterator that yields queued PCM chunks until synthesis
+                completes or fails.
             """
-            try:
-                if len(text_chunks) == 1 and not self.config.postprocess_output_audio:
-                    for pcm_chunk in self._stream_short_request_pcm_chunks(
-                        request=request,
-                        prepared_voice=prepared_voice,
-                    ):
+            prepared_voice = self._resolve_prepared_voice_conditioning(voice)
+            text_chunks = self._plan_request_chunks(request.text)
+            item_queue: "queue.Queue[object]" = queue.Queue(maxsize=8)
+            finished_marker = object()
+            stop_event = threading.Event()
+
+            def push_queue_item(item: object, force: bool = False) -> bool:
+                """Push an item into the streaming queue while honoring cancellation.
+
+                Usage:
+                    The background producer uses this helper to provide bounded
+                    backpressure and to stop cleanly when the async consumer has gone
+                    away or cancelled the response.
+
+                Parameters:
+                    item: The queue item to push.
+                    force: When true, keep trying to deliver the item even if the stop
+                        flag has not been observed yet. This is used for the final
+                        completion marker while a consumer is still actively draining
+                        the queue.
+
+                Returns:
+                    `True` when the item was queued successfully, otherwise `False`
+                    when cancellation prevented delivery.
+                """
+                while True:
+                    if stop_event.is_set() and not force:
+                        return False
+                    try:
+                        item_queue.put(item, timeout=0.25)
+                        return True
+                    except queue.Full:
                         if stop_event.is_set():
-                            break
-                        if not push_queue_item(pcm_chunk):
-                            break
-                else:
-                    if len(text_chunks) > 1:
-                        LOGGER.info(
-                            "Chunking streaming request for voice %s into %d long-form segments.",
-                            prepared_voice.voice_id,
-                            len(text_chunks),
-                        )
-                        pcm_chunk_iterator = self._stream_longform_pcm_chunks(
-                            text_chunks=text_chunks,
+                            return False
+
+            def produce_streaming_audio() -> None:
+                """Run the selected streaming strategy inside a background thread.
+
+                Usage:
+                    Short requests keep the vendored low-latency upstream streaming
+                    path, while long-form chunked requests use chunk-level generation
+                    and boundary smoothing before PCM bytes are queued.
+
+                Parameters:
+                    None. It closes over the validated request state.
+
+                Returns:
+                    None. PCM chunks and terminal markers are delivered through the queue.
+                """
+                try:
+                    if len(text_chunks) == 1 and not self.config.postprocess_output_audio:
+                        for pcm_chunk in self._stream_short_request_pcm_chunks(
                             request=request,
                             prepared_voice=prepared_voice,
-                        )
+                        ):
+                            if stop_event.is_set():
+                                break
+                            if not push_queue_item(pcm_chunk):
+                                break
                     else:
-                        pcm_chunk_iterator = self._stream_buffered_request_pcm_chunks(
-                            request=request,
-                            prepared_voice=prepared_voice,
-                        )
+                        if len(text_chunks) > 1:
+                            LOGGER.info(
+                                "Chunking streaming request for voice %s into %d long-form segments.",
+                                prepared_voice.voice_id,
+                                len(text_chunks),
+                            )
+                            pcm_chunk_iterator = self._stream_longform_pcm_chunks(
+                                text_chunks=text_chunks,
+                                request=request,
+                                prepared_voice=prepared_voice,
+                            )
+                        else:
+                            pcm_chunk_iterator = self._stream_buffered_request_pcm_chunks(
+                                request=request,
+                                prepared_voice=prepared_voice,
+                            )
 
-                    for pcm_chunk in pcm_chunk_iterator:
-                        if stop_event.is_set():
-                            break
-                        if not push_queue_item(pcm_chunk):
-                            break
-            except Exception as exc:  # pragma: no cover - exercised during runtime integration.
-                push_queue_item(exc)
+                        for pcm_chunk in pcm_chunk_iterator:
+                            if stop_event.is_set():
+                                break
+                            if not push_queue_item(pcm_chunk):
+                                break
+                except Exception as exc:  # pragma: no cover - exercised during runtime integration.
+                    push_queue_item(exc)
+                finally:
+                    push_queue_item(finished_marker, force=True)
+
+            threading.Thread(target=produce_streaming_audio, daemon=True).start()
+            loop = asyncio.get_running_loop()
+
+            try:
+                while True:
+                    next_item = await loop.run_in_executor(None, item_queue.get)
+                    if next_item is finished_marker:
+                        break
+                    if isinstance(next_item, Exception):
+                        raise next_item
+                    yield next_item
             finally:
-                push_queue_item(finished_marker, force=True)
+                stop_event.set()
 
-        threading.Thread(target=produce_streaming_audio, daemon=True).start()
-        loop = asyncio.get_running_loop()
-
-        try:
-            while True:
-                next_item = await loop.run_in_executor(None, item_queue.get)
-                if next_item is finished_marker:
-                    break
-                if isinstance(next_item, Exception):
-                    raise next_item
-                yield next_item
-        finally:
-            stop_event.set()
+        return consume_streaming_audio()
 
     def _load_model(self) -> None:
         """Load the upstream CUDA-graph model using the configured device and dtype.
