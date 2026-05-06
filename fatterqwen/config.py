@@ -32,6 +32,16 @@ class ServerConfig:
     wyoming_uri: Optional[str]
     wyoming_audio_chunk_samples: int
     log_level: str
+    preprocess_reference_audio: bool = True
+    normalize_reference_transcript: bool = True
+    reference_prompt_target_rms: float = 0.1
+    postprocess_output_audio: bool = True
+    longform_chunking_enabled: bool = True
+    longform_chunk_threshold_units: int = 320
+    longform_target_units: int = 200
+    longform_min_units: int = 70
+    longform_crossfade_milliseconds: int = 80
+    longform_gap_milliseconds: int = 120
 
 
 def environment_default(name: str, default: str) -> str:
@@ -164,6 +174,66 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Maximum request text length accepted by the server.",
     )
     parser.add_argument(
+        "--preprocess-reference-audio",
+        action=argparse.BooleanOptionalAction,
+        default=environment_flag("FATTERQWEN_PREPROCESS_REFERENCE_AUDIO", True),
+        help="Remove excessive silence from reference prompt audio before caching it for voice cloning.",
+    )
+    parser.add_argument(
+        "--normalize-reference-transcript",
+        action=argparse.BooleanOptionalAction,
+        default=environment_flag("FATTERQWEN_NORMALIZE_REFERENCE_TRANSCRIPT", True),
+        help="Add missing terminal punctuation to reference transcripts before synthesis.",
+    )
+    parser.add_argument(
+        "--reference-prompt-target-rms",
+        type=float,
+        default=float(environment_default("FATTERQWEN_REFERENCE_PROMPT_TARGET_RMS", "0.1")),
+        help="Minimum RMS level applied to very quiet reference audio during prompt preparation.",
+    )
+    parser.add_argument(
+        "--postprocess-output-audio",
+        action=argparse.BooleanOptionalAction,
+        default=environment_flag("FATTERQWEN_POSTPROCESS_OUTPUT_AUDIO", True),
+        help="Compact excessive silences in generated audio before returning it to clients.",
+    )
+    parser.add_argument(
+        "--longform-chunking",
+        action=argparse.BooleanOptionalAction,
+        default=environment_flag("FATTERQWEN_LONGFORM_CHUNKING", True),
+        help="Split large requests into multiple synthesis calls with smoothed chunk boundaries.",
+    )
+    parser.add_argument(
+        "--longform-chunk-threshold-units",
+        type=int,
+        default=int(environment_default("FATTERQWEN_LONGFORM_CHUNK_THRESHOLD_UNITS", "320")),
+        help="Estimated speech-unit threshold above which long-form chunking is activated.",
+    )
+    parser.add_argument(
+        "--longform-target-units",
+        type=int,
+        default=int(environment_default("FATTERQWEN_LONGFORM_TARGET_UNITS", "200")),
+        help="Preferred estimated speech-unit size for each long-form synthesis chunk.",
+    )
+    parser.add_argument(
+        "--longform-min-units",
+        type=int,
+        default=int(environment_default("FATTERQWEN_LONGFORM_MIN_UNITS", "70")),
+        help="Minimum estimated speech-unit size for a trailing chunk before it is merged back into the previous one.",
+    )
+    parser.add_argument(
+        "--longform-crossfade-milliseconds",
+        type=int,
+        default=int(environment_default("FATTERQWEN_LONGFORM_CROSSFADE_MILLISECONDS", "80")),
+        help="Fade duration used when smoothing the boundary between long-form synthesis chunks.",
+    )
+    parser.add_argument(
+        "--longform-gap-milliseconds",
+        type=int,
+        default=int(environment_default("FATTERQWEN_LONGFORM_GAP_MILLISECONDS", "120")),
+        help="Silence gap inserted between long-form synthesis chunks before the next chunk fades in.",
+    )
+    parser.add_argument(
         "--model-cache-dir",
         default=(
             environment_default("FATTERQWEN_MODEL_CACHE_DIR", "")
@@ -242,6 +312,18 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         parser.error("--chunk-size must be a positive integer.")
     if args.max_text_length <= 0:
         parser.error("--max-text-length must be a positive integer.")
+    if args.reference_prompt_target_rms < 0.0:
+        parser.error("--reference-prompt-target-rms must be zero or positive.")
+    if args.longform_chunk_threshold_units <= 0:
+        parser.error("--longform-chunk-threshold-units must be a positive integer.")
+    if args.longform_target_units <= 0:
+        parser.error("--longform-target-units must be a positive integer.")
+    if args.longform_min_units <= 0:
+        parser.error("--longform-min-units must be a positive integer.")
+    if args.longform_crossfade_milliseconds < 0:
+        parser.error("--longform-crossfade-milliseconds must be zero or positive.")
+    if args.longform_gap_milliseconds < 0:
+        parser.error("--longform-gap-milliseconds must be zero or positive.")
     if args.wyoming_audio_chunk_samples <= 0:
         parser.error("--wyoming-audio-chunk-samples must be a positive integer.")
 
@@ -279,4 +361,14 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         wyoming_uri=wyoming_uri,
         wyoming_audio_chunk_samples=args.wyoming_audio_chunk_samples,
         log_level=args.log_level.upper(),
+        preprocess_reference_audio=args.preprocess_reference_audio,
+        normalize_reference_transcript=args.normalize_reference_transcript,
+        reference_prompt_target_rms=args.reference_prompt_target_rms,
+        postprocess_output_audio=args.postprocess_output_audio,
+        longform_chunking_enabled=args.longform_chunking,
+        longform_chunk_threshold_units=args.longform_chunk_threshold_units,
+        longform_target_units=args.longform_target_units,
+        longform_min_units=args.longform_min_units,
+        longform_crossfade_milliseconds=args.longform_crossfade_milliseconds,
+        longform_gap_milliseconds=args.longform_gap_milliseconds,
     )

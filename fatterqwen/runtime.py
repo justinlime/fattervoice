@@ -79,34 +79,37 @@ async def run_server(config: ServerConfig) -> None:
     service = TtsService(config=config, voice_registry=voice_registry)
     await service.start()
 
-    server_tasks = {
-        asyncio.create_task(
-            run_http_server(service=service, voice_registry=voice_registry, config=config),
-            name="fatterqwen-http",
-        )
-    }
-    if config.wyoming_enabled:
-        server_tasks.add(
+    try:
+        server_tasks = {
             asyncio.create_task(
-                run_wyoming_server(
-                    service=service,
-                    voice_registry=voice_registry,
-                    config=config,
-                ),
-                name="fatterqwen-wyoming",
+                run_http_server(service=service, voice_registry=voice_registry, config=config),
+                name="fatterqwen-http",
             )
+        }
+        if config.wyoming_enabled:
+            server_tasks.add(
+                asyncio.create_task(
+                    run_wyoming_server(
+                        service=service,
+                        voice_registry=voice_registry,
+                        config=config,
+                    ),
+                    name="fatterqwen-wyoming",
+                )
+            )
+
+        done_tasks, pending_tasks = await asyncio.wait(
+            server_tasks,
+            return_when=asyncio.FIRST_COMPLETED,
         )
 
-    done_tasks, pending_tasks = await asyncio.wait(
-        server_tasks,
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+        for completed_task in done_tasks:
+            completed_task.result()
 
-    for completed_task in done_tasks:
-        completed_task.result()
+        for pending_task in pending_tasks:
+            pending_task.cancel()
 
-    for pending_task in pending_tasks:
-        pending_task.cancel()
-
-    if pending_tasks:
-        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+    finally:
+        service.close()

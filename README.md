@@ -71,6 +71,16 @@ CLI arguments take precedence, and environment variables act as fallbacks.
 | `--append-silence` / `--no-append-silence` | `FATTERQWEN_APPEND_SILENCE` | `true` |
 | `--non-streaming-mode` / `--no-non-streaming-mode` | `FATTERQWEN_NON_STREAMING_MODE` | `false` |
 | `--max-text-length` | `FATTERQWEN_MAX_TEXT_LENGTH` | `4000` |
+| `--preprocess-reference-audio` / `--no-preprocess-reference-audio` | `FATTERQWEN_PREPROCESS_REFERENCE_AUDIO` | `true` |
+| `--normalize-reference-transcript` / `--no-normalize-reference-transcript` | `FATTERQWEN_NORMALIZE_REFERENCE_TRANSCRIPT` | `true` |
+| `--reference-prompt-target-rms` | `FATTERQWEN_REFERENCE_PROMPT_TARGET_RMS` | `0.1` |
+| `--postprocess-output-audio` / `--no-postprocess-output-audio` | `FATTERQWEN_POSTPROCESS_OUTPUT_AUDIO` | `true` |
+| `--longform-chunking` / `--no-longform-chunking` | `FATTERQWEN_LONGFORM_CHUNKING` | `true` |
+| `--longform-chunk-threshold-units` | `FATTERQWEN_LONGFORM_CHUNK_THRESHOLD_UNITS` | `320` |
+| `--longform-target-units` | `FATTERQWEN_LONGFORM_TARGET_UNITS` | `200` |
+| `--longform-min-units` | `FATTERQWEN_LONGFORM_MIN_UNITS` | `70` |
+| `--longform-crossfade-milliseconds` | `FATTERQWEN_LONGFORM_CROSSFADE_MILLISECONDS` | `80` |
+| `--longform-gap-milliseconds` | `FATTERQWEN_LONGFORM_GAP_MILLISECONDS` | `120` |
 | `--model-cache-dir` | `FATTERQWEN_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
 | `--prefetch-manifest` | `FATTERQWEN_PREFETCH_MANIFEST` | empty / unset |
 | `--warmup` / `--no-warmup` | `FATTERQWEN_WARMUP` | `false` |
@@ -81,6 +91,13 @@ CLI arguments take precedence, and environment variables act as fallbacks.
 | `--log-level` | `FATTERQWEN_LOG_LEVEL` | `INFO` |
 
 Boolean environment variables accept `1`, `true`, `yes`, or `on` for true, and `0`, `false`, `no`, or `off` for false.
+
+The wrapper now also applies a built-in voice-cloning quality pipeline before and after inference:
+
+- reference audio can be silence-compacted and quiet prompts can be RMS-normalized before caching
+- reference transcripts can receive missing terminal punctuation for more stable prosody
+- long requests can be split into multiple weighted text chunks with smoothed boundaries
+- generated audio can be silence-compacted and edge-faded before being returned
 
 ## OpenAI-compatible API
 
@@ -163,15 +180,27 @@ Build the image:
 docker build -t fatterqwen .
 ```
 
+By default, the Docker image now prefetches **both** supported built-in models (`0.6B` and `1.7B`). That means a normal image build can safely run later with either `FATTERQWEN_MODEL=0.6B` or `FATTERQWEN_MODEL=1.7B` while still staying offline at runtime.
+
 The Dockerfile is now single-stage and layered so that dependency installation and model prefetch happen before the frequently changing `fatterqwen/` application code is copied. That means ordinary Python logic edits should usually only invalidate the final lightweight install layer instead of forcing a full dependency and model rebuild. A `.dockerignore` file also keeps tests, voices, caches, and other non-runtime content out of the build context so Podman/Docker do less work before the first layer even starts. The build also writes `/opt/fatterqwen/prefetched-models.json`, allowing runtime startup to resolve exact local snapshot paths instead of relying only on cache discovery in offline mode.
 
-Build an image that prefetches both supported models:
+Build a smaller single-model image instead:
+
+```bash
+docker build \
+  --build-arg MODEL_SELECTION=0.6B \
+  -t fatterqwen:0.6b .
+```
+
+Or explicitly build an image that prefetches both supported models:
 
 ```bash
 docker build \
   --build-arg MODEL_SELECTION=all \
   -t fatterqwen:all-models .
 ```
+
+If you build a single-model offline image, keep the runtime model selection aligned with that build. For example, an image built with `MODEL_SELECTION=0.6B` should run with `FATTERQWEN_MODEL=0.6B` unless you rebuild it with `MODEL_SELECTION=all`.
 
 If you need Blackwell-oriented wheels, override the CUDA and PyTorch build arguments to a CUDA 12.8 stack:
 
