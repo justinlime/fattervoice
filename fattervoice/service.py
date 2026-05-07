@@ -22,6 +22,7 @@ from .prefetch_manifest import resolve_cached_model_snapshot_path
 from .voice_registry import VoiceEntry, VoiceRegistry
 
 LOGGER = logging.getLogger(__name__)
+_HARDCODED_MODEL_ALIAS = "omnivoice"
 _STREAMING_PCM_CHUNK_BYTES = 8192
 
 
@@ -220,7 +221,7 @@ class TtsService:
         """
         self.config = config
         self.voice_registry = voice_registry
-        self.model_id = resolve_model_id(config.model)
+        self.model_id = resolve_model_id(_HARDCODED_MODEL_ALIAS)
         self.device_map = normalize_omnivoice_device_map(config.device)
         self._model = None
         self._model_lock = threading.Lock()
@@ -301,7 +302,7 @@ class TtsService:
             The resolved `VoiceEntry` that should be used for synthesis.
 
         Raises:
-            ValueError: If the request text is empty or exceeds the configured limit.
+            ValueError: If the request text is empty after surrounding whitespace is removed.
             VoiceRegistryError: If the requested voice does not exist.
         """
         self._validate_request_text(request.text)
@@ -463,8 +464,8 @@ class TtsService:
                 if built_model_id_hint != self.model_id:
                     raise FileNotFoundError(
                         "Offline mode is enabled, but this container image was built without the requested OmniVoice model. "
-                        f"The image build hint is {build_model_selection_hint!r}, while runtime requested {self.config.model!r} "
-                        f"({self.model_id}). Rebuild the image with --build-arg MODEL_SELECTION=all or --build-arg MODEL_SELECTION={self.config.model}, "
+                        f"The image build hint is {build_model_selection_hint!r}, while runtime requested {_HARDCODED_MODEL_ALIAS!r} "
+                        f"({self.model_id}). Rebuild the image with --build-arg MODEL_SELECTION=all or --build-arg MODEL_SELECTION={_HARDCODED_MODEL_ALIAS}, "
                         "or run an image that already contains the requested snapshot."
                     )
             raise FileNotFoundError(
@@ -474,7 +475,7 @@ class TtsService:
 
         LOGGER.info(
             "Loading OmniVoice model %s from %s on device %s with dtype %s",
-            self.config.model,
+            _HARDCODED_MODEL_ALIAS,
             model_source,
             self.device_map,
             self.config.dtype,
@@ -587,7 +588,8 @@ class TtsService:
 
         Usage:
             Both streaming and non-streaming synthesis call this helper to reject
-            empty or excessively long requests consistently across protocols.
+            empty requests consistently across protocol adapters before any model
+            work or voice resolution begins.
 
         Parameters:
             text: The request text that will be synthesized.
@@ -596,16 +598,11 @@ class TtsService:
             None. The function succeeds silently when the text is acceptable.
 
         Raises:
-            ValueError: If the text is empty or longer than the configured limit.
+            ValueError: If the text is empty after surrounding whitespace is removed.
         """
         normalized_text = text.strip()
         if not normalized_text:
             raise ValueError("Synthesis text cannot be empty.")
-        if len(normalized_text) > self.config.max_text_length:
-            raise ValueError(
-                "Synthesis text exceeds the configured maximum length of "
-                f"{self.config.max_text_length} characters."
-            )
 
     def _generate_waveform(
         self,

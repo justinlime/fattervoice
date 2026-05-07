@@ -49,10 +49,10 @@ Run the server:
 ```bash
 uv run fattervoice \
   --voices-dir ./voices \
-  --model omnivoice \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --wyoming-uri tcp://0.0.0.0:10300
+  --openapi-host 0.0.0.0 \
+  --openapi-port 8000 \
+  --wyoming-host 0.0.0.0 \
+  --wyoming-port 10300
 ```
 
 CLI arguments take precedence, and environment variables act as fallbacks.
@@ -62,14 +62,12 @@ CLI arguments take precedence, and environment variables act as fallbacks.
 | CLI flag | ENV fallback | Default |
 | --- | --- | --- |
 | `--voices-dir` | `FATTERVOICE_VOICES_DIR` | `voices` |
-| `--host` | `FATTERVOICE_HOST` | `0.0.0.0` |
-| `--port` | `FATTERVOICE_PORT` | `8000` |
-| `--model` | `FATTERVOICE_MODEL` | `omnivoice` |
+| `--openapi-host` | `FATTERVOICE_OPENAPI_HOST` | `0.0.0.0` |
+| `--openapi-port` | `FATTERVOICE_OPENAPI_PORT` | `8000` |
 | `--device` | `FATTERVOICE_DEVICE` | `cuda:0` |
-| `--dtype` | `FATTERVOICE_DTYPE` | `float16` |
+| `--dtype` | `FATTERVOICE_DTYPE` | `bfloat16` |
 | `--default-language` | `FATTERVOICE_DEFAULT_LANGUAGE` | `auto` |
-| `--max-text-length` | `FATTERVOICE_MAX_TEXT_LENGTH` | `4000` |
-| `--num-step` | `FATTERVOICE_NUM_STEP` | `16` |
+| `--num-step` | `FATTERVOICE_NUM_STEP` | `32` |
 | `--guidance-scale` | `FATTERVOICE_GUIDANCE_SCALE` | `2.0` |
 | `--denoise` / `--no-denoise` | `FATTERVOICE_DENOISE` | `true` |
 | `--t-shift` | `FATTERVOICE_T_SHIFT` | `0.1` |
@@ -80,24 +78,27 @@ CLI arguments take precedence, and environment variables act as fallbacks.
 | `--postprocess-output-audio` / `--no-postprocess-output-audio` | `FATTERVOICE_POSTPROCESS_OUTPUT_AUDIO` | `true` |
 | `--audio-chunk-duration` | `FATTERVOICE_AUDIO_CHUNK_DURATION` | `15.0` |
 | `--audio-chunk-threshold` | `FATTERVOICE_AUDIO_CHUNK_THRESHOLD` | `30.0` |
-| `--wyoming-enabled` / `--no-wyoming-enabled` | `FATTERVOICE_WYOMING_ENABLED` | `true` |
-| `--wyoming-uri` | `FATTERVOICE_WYOMING_URI` | `tcp://0.0.0.0:10300` |
+| `--wyoming-host` | `FATTERVOICE_WYOMING_HOST` | `0.0.0.0` |
+| `--wyoming-port` | `FATTERVOICE_WYOMING_PORT` | `10300` |
 | `--log-level` | `FATTERVOICE_LOG_LEVEL` | `INFO` |
 
 Boolean environment variables accept `1`, `true`, `yes`, or `on` for true, and `0`, `false`, `no`, or `off` for false.
 
-Wyoming audio chunking is now fixed at `4096` mono PCM samples per emitted `audio-chunk`, and model-cache / prefetch-manifest selection is no longer exposed through wrapper-specific server flags.
+At startup, `fattervoice` logs the fully resolved runtime configuration in a boxed summary so you can confirm the exact effective settings before it begins serving traffic.
+
+The runtime model is now hardcoded to `omnivoice`, Wyoming support is always enabled, Wyoming audio chunking is fixed at `4096` mono PCM samples per emitted `audio-chunk`, and model-cache / prefetch-manifest selection is no longer exposed through wrapper-specific server flags.
 
 ### OmniVoice tuning defaults
 
 The server is tuned for **fast voice cloning with strong retained quality**:
 
 - voice-clone prompts are cached lazily on first use and retained in CPU memory so previously used voices can be reused without re-tokenizing their reference audio while inactive voices stop pinning VRAM between requests
-- `num_step=16` is the default speed-focused OmniVoice setting
+- `num_step=32` is the default balanced speed/quality OmniVoice setting
+- `dtype=bfloat16` is the default precision setting
 - reference transcripts remain mandatory for stable cloning and offline operation
 - OmniVoice prompt preprocessing and output postprocessing remain enabled by default
 
-If you want to bias further toward quality, increase `--num-step` to `32`.
+If you want to bias further toward lower latency, decrease `--num-step` to `16`.
 
 ## OpenAI-compatible API
 
@@ -131,7 +132,7 @@ curl http://localhost:8000/v1/audio/speech \
 
 ## Wyoming support
 
-By default the server also exposes a Wyoming TCP endpoint at `tcp://0.0.0.0:10300`.
+By default the server also exposes a Wyoming TCP endpoint at `tcp://0.0.0.0:10300`, configured through `--wyoming-host` plus `--wyoming-port`.
 
 The Wyoming handler:
 

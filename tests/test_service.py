@@ -168,17 +168,15 @@ def build_test_config(temp_dir: str, **overrides: object) -> ServerConfig:
     """
     config_values: dict[str, object] = {
         "voices_dir": Path(temp_dir) / "voices",
-        "host": "0.0.0.0",
-        "port": 8000,
-        "model": "omnivoice",
+        "openapi_host": "0.0.0.0",
+        "openapi_port": 8000,
         "device": "cuda:0",
-        "dtype": "float16",
+        "dtype": "bfloat16",
         "default_language": "auto",
-        "max_text_length": 4000,
-        "wyoming_enabled": True,
-        "wyoming_uri": "tcp://0.0.0.0:10300",
+        "wyoming_host": "0.0.0.0",
+        "wyoming_port": 10300,
         "log_level": "INFO",
-        "num_step": 16,
+        "num_step": 32,
         "guidance_scale": 2.0,
         "denoise": True,
         "t_shift": 0.1,
@@ -278,7 +276,7 @@ class TtsServiceTests(unittest.TestCase):
                 captured_call["load_asr"] = load_asr
                 return FakeLoadedModel()
 
-        fake_torch_module = types.SimpleNamespace(float16="fake-float16")
+        fake_torch_module = types.SimpleNamespace(bfloat16="fake-bfloat16")
         fake_omnivoice_module = types.SimpleNamespace(OmniVoice=FakeOmniVoice)
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -306,30 +304,31 @@ class TtsServiceTests(unittest.TestCase):
         self.assertIsNotNone(service._model)
         self.assertEqual(captured_call["model_name"], str(local_model_path))
         self.assertEqual(captured_call["device_map"], "cuda:0")
-        self.assertEqual(captured_call["dtype"], "fake-float16")
+        self.assertEqual(captured_call["dtype"], "fake-bfloat16")
         self.assertFalse(captured_call["load_asr"])
 
     def test_load_model_explains_single_model_offline_image_mismatch(self) -> None:
-        """Ensure offline startup explains when runtime requests a non-prefetched model.
+        """Ensure offline startup explains when the image was built without OmniVoice.
 
         Usage:
-            Operators may build a lean image with the built-in OmniVoice snapshot
-            and later override `FATTERVOICE_MODEL` at runtime to another Hugging
-            Face repo. This test verifies that the resulting offline error clearly
-            points to the build/runtime mismatch instead of only reporting a cache miss.
+            Runtime model selection is now hardcoded to the built-in OmniVoice
+            alias, but operators can still build an image that prefetched some
+            other model selection hint. This test verifies that the resulting
+            offline error clearly points to the build/runtime mismatch instead of
+            only reporting a cache miss.
 
         Parameters:
             None.
 
         Returns:
             None. The test asserts that the raised error mentions both the build
-            hint and the requested runtime model.
+            hint and the hardcoded runtime model.
         """
-        fake_torch_module = types.SimpleNamespace(float16="fake-float16")
+        fake_torch_module = types.SimpleNamespace(bfloat16="fake-bfloat16")
         fake_omnivoice_module = types.SimpleNamespace(OmniVoice=object)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            config = build_test_config(temp_dir, model="acme/custom-omnivoice")
+            config = build_test_config(temp_dir)
             service = TtsService(
                 config=config,
                 voice_registry=FakeVoiceRegistry([build_test_voice_entry(temp_dir)]),
@@ -345,7 +344,7 @@ class TtsServiceTests(unittest.TestCase):
                         "omnivoice": fake_omnivoice_module,
                     },
                 ),
-                patch.dict(os.environ, {"MODEL_SELECTION_HINT": "omnivoice"}, clear=False),
+                patch.dict(os.environ, {"MODEL_SELECTION_HINT": "acme/custom-omnivoice"}, clear=False),
             ):
                 with self.assertRaises(FileNotFoundError) as raised_error:
                     service._load_model()
@@ -381,6 +380,35 @@ class TtsServiceTests(unittest.TestCase):
 
         self.assertEqual(len(fake_model.created_prompts), 0)
         self.assertEqual(service._prepared_voice_cache, {})
+
+    def test_validate_request_accepts_long_text_when_length_limit_is_removed(self) -> None:
+        """Ensure request validation no longer rejects long text by character count.
+
+        Usage:
+            The server no longer exposes a max-text-length configuration knob, so
+            this regression test verifies that validation still rejects empty
+            input but now allows long non-empty text to proceed to voice
+            resolution unchanged.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that a long request resolves to the requested
+            voice instead of raising a length-related validation error.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voice_entry = build_test_voice_entry(temp_dir)
+            service = TtsService(
+                config=build_test_config(temp_dir),
+                voice_registry=FakeVoiceRegistry([voice_entry]),
+            )
+
+            resolved_voice = service.validate_request(
+                SynthesisRequest(text="A" * 20000, voice_id=voice_entry.voice_id)
+            )
+
+        self.assertEqual(resolved_voice.voice_id, voice_entry.voice_id)
 
     def test_synthesize_reuses_cached_voice_prompts_across_voice_swaps(self) -> None:
         """Ensure each voice prompt is prepared once and reused after later swaps.

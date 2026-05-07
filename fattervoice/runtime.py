@@ -45,7 +45,7 @@ async def run_http_server(service: TtsService, voice_registry: VoiceRegistry, co
     Parameters:
         service: Shared synthesis service used by all HTTP requests.
         voice_registry: Shared validated voice registry exposed via HTTP discovery routes.
-        config: Immutable runtime configuration containing the bind host and port.
+        config: Immutable runtime configuration containing the OpenAI-compatible HTTP bind host and port.
 
     Returns:
         None. The coroutine runs until the HTTP server shuts down.
@@ -53,8 +53,8 @@ async def run_http_server(service: TtsService, voice_registry: VoiceRegistry, co
     application = create_openai_app(service=service, voice_registry=voice_registry, config=config)
     uvicorn_config = uvicorn.Config(
         application,
-        host=config.host,
-        port=config.port,
+        host=config.openapi_host,
+        port=config.openapi_port,
         log_level=config.log_level.lower(),
     )
     await uvicorn.Server(uvicorn_config).serve()
@@ -84,19 +84,16 @@ async def run_server(config: ServerConfig) -> None:
             asyncio.create_task(
                 run_http_server(service=service, voice_registry=voice_registry, config=config),
                 name="fattervoice-http",
-            )
+            ),
+            asyncio.create_task(
+                run_wyoming_server(
+                    service=service,
+                    voice_registry=voice_registry,
+                    config=config,
+                ),
+                name="fattervoice-wyoming",
+            ),
         }
-        if config.wyoming_enabled:
-            server_tasks.add(
-                asyncio.create_task(
-                    run_wyoming_server(
-                        service=service,
-                        voice_registry=voice_registry,
-                        config=config,
-                    ),
-                    name="fattervoice-wyoming",
-                )
-            )
 
         done_tasks, pending_tasks = await asyncio.wait(
             server_tasks,

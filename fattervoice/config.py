@@ -6,7 +6,31 @@ import argparse
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Sequence
+
+
+def build_tcp_uri(host: str, port: int) -> str:
+    """Build a TCP URI string from a host and port, including IPv6-safe formatting.
+
+    Usage:
+        The runtime exposes split host/port configuration for both OpenAI-compatible
+        HTTP and Wyoming networking, but the Wyoming server still expects one final
+        `tcp://...` URI string. This helper keeps that assembly logic centralized
+        and ensures IPv6 literals are wrapped in brackets before the port suffix is
+        appended.
+
+    Parameters:
+        host: The configured bind host or address literal.
+        port: The configured TCP port.
+
+    Returns:
+        A `tcp://host:port` URI string, with IPv6 literals normalized to the
+        bracketed URI form.
+    """
+    normalized_host = host.strip()
+    if ":" in normalized_host and not normalized_host.startswith("["):
+        normalized_host = f"[{normalized_host}]"
+    return f"tcp://{normalized_host}:{port}"
 
 
 @dataclass(frozen=True)
@@ -14,17 +38,15 @@ class ServerConfig:
     """Immutable runtime configuration shared by the HTTP and Wyoming servers."""
 
     voices_dir: Path
-    host: str
-    port: int
-    model: str
+    openapi_host: str
+    openapi_port: int
     device: str
     dtype: str
     default_language: str
-    max_text_length: int
-    wyoming_enabled: bool
-    wyoming_uri: Optional[str]
+    wyoming_host: str
+    wyoming_port: int
     log_level: str
-    num_step: int = 16
+    num_step: int = 32
     guidance_scale: float = 2.0
     denoise: bool = True
     t_shift: float = 0.1
@@ -35,6 +57,121 @@ class ServerConfig:
     postprocess_output_audio: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+
+    @property
+    def wyoming_uri(self) -> str:
+        """Build the Wyoming TCP URI from the split host and port settings.
+
+        Usage:
+            The external configuration surface now exposes Wyoming host and port
+            as separate values, while the server runtime still needs one final
+            URI string to pass into `wyoming.AsyncServer.from_uri(...)`.
+
+        Parameters:
+            None.
+
+        Returns:
+            A `tcp://host:port` URI string suitable for the Wyoming server,
+            including bracketed formatting for IPv6 literals.
+        """
+        return build_tcp_uri(self.wyoming_host, self.wyoming_port)
+
+
+
+def format_config_value(value: object) -> str:
+    """Convert a resolved configuration value into a stable startup-log string.
+
+    Usage:
+        Startup summary rendering calls this helper for every effective config
+        value so booleans, paths, and scalar settings all display consistently.
+
+    Parameters:
+        value: The already-resolved configuration value that should be rendered.
+
+    Returns:
+        A user-friendly string representation suitable for multi-line startup
+        logging output.
+    """
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+
+def format_server_config_summary(config: ServerConfig) -> str:
+    """Render the full effective server configuration as a boxed multi-line string.
+
+    Usage:
+        The CLI logs this summary once during startup so operators can quickly
+        verify the exact runtime settings that won after CLI parsing and
+        environment fallback resolution.
+
+    Parameters:
+        config: The fully resolved immutable runtime configuration.
+
+    Returns:
+        A boxed multi-line string that groups every public config value into
+        readable sections for startup logs.
+    """
+    section_rows = (
+        (
+            "Network",
+            (
+                ("OpenAI host", config.openapi_host),
+                ("OpenAI port", config.openapi_port),
+                ("Wyoming host", config.wyoming_host),
+                ("Wyoming port", config.wyoming_port),
+            ),
+        ),
+        (
+            "Runtime",
+            (
+                ("Voices directory", config.voices_dir),
+                ("Device", config.device),
+                ("Dtype", config.dtype),
+                ("Log level", config.log_level),
+                ("Default language", config.default_language),
+            ),
+        ),
+        (
+            "Generation",
+            (
+                ("num_step", config.num_step),
+                ("guidance_scale", config.guidance_scale),
+                ("denoise", config.denoise),
+                ("t_shift", config.t_shift),
+                ("position_temperature", config.position_temperature),
+                ("class_temperature", config.class_temperature),
+                ("layer_penalty_factor", config.layer_penalty_factor),
+                ("preprocess_voice_clone_prompt", config.preprocess_voice_clone_prompt),
+                ("postprocess_output_audio", config.postprocess_output_audio),
+                ("audio_chunk_duration", config.audio_chunk_duration),
+                ("audio_chunk_threshold", config.audio_chunk_threshold),
+            ),
+        ),
+    )
+    label_width = max(len(label) for _, rows in section_rows for label, _ in rows)
+    content_lines: list[str] = []
+
+    for section_index, (section_name, rows) in enumerate(section_rows):
+        if section_index:
+            content_lines.append("")
+        content_lines.append(section_name)
+        for label, value in rows:
+            content_lines.append(
+                f"  {label.ljust(label_width)} : {format_config_value(value)}"
+            )
+
+    title = "fattervoice startup configuration"
+    inner_width = max(len(title), *(len(line) for line in content_lines))
+    top_border = f"╭{'─' * (inner_width + 2)}╮"
+    title_line = f"│ {title.ljust(inner_width)} │"
+    separator_line = f"├{'─' * (inner_width + 2)}┤"
+    body_lines = [f"│ {line.ljust(inner_width)} │" for line in content_lines]
+    bottom_border = f"╰{'─' * (inner_width + 2)}╯"
+    return "\n".join([top_border, title_line, separator_line, *body_lines, bottom_border])
 
 
 
@@ -113,20 +250,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Directory containing <voice>.<audio> and <voice>.txt pairs.",
     )
     parser.add_argument(
-        "--host",
-        default=environment_default("FATTERVOICE_HOST", "0.0.0.0"),
-        help="HTTP bind host.",
+        "--openapi-host",
+        default=environment_default("FATTERVOICE_OPENAPI_HOST", "0.0.0.0"),
+        help="OpenAI-compatible HTTP bind host.",
     )
     parser.add_argument(
-        "--port",
+        "--openapi-port",
         type=int,
-        default=int(environment_default("FATTERVOICE_PORT", "8000")),
-        help="HTTP bind port.",
-    )
-    parser.add_argument(
-        "--model",
-        default=environment_default("FATTERVOICE_MODEL", "omnivoice"),
-        help="Model alias (`omnivoice`) or a direct model ID/path.",
+        default=int(environment_default("FATTERVOICE_OPENAPI_PORT", "8000")),
+        help="OpenAI-compatible HTTP bind port.",
     )
     parser.add_argument(
         "--device",
@@ -135,7 +267,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dtype",
-        default=environment_default("FATTERVOICE_DTYPE", "float16"),
+        default=environment_default("FATTERVOICE_DTYPE", "bfloat16"),
         help="Torch dtype name such as float16, bfloat16, or float32.",
     )
     parser.add_argument(
@@ -144,16 +276,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Fallback language ID or name passed to OmniVoice when the client does not specify one.",
     )
     parser.add_argument(
-        "--max-text-length",
-        type=int,
-        default=int(environment_default("FATTERVOICE_MAX_TEXT_LENGTH", "4000")),
-        help="Maximum request text length accepted by the server.",
-    )
-    parser.add_argument(
         "--num-step",
         type=int,
-        default=int(environment_default("FATTERVOICE_NUM_STEP", "16")),
-        help="OmniVoice diffusion decoding steps. Lower is faster; 16 is the default speed-focused setting.",
+        default=int(environment_default("FATTERVOICE_NUM_STEP", "32")),
+        help="OmniVoice diffusion decoding steps. Lower is faster; 32 is the default balanced setting.",
     )
     parser.add_argument(
         "--guidance-scale",
@@ -216,15 +342,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Estimated duration threshold in seconds above which OmniVoice chunked long-form generation is activated.",
     )
     parser.add_argument(
-        "--wyoming-enabled",
-        action=argparse.BooleanOptionalAction,
-        default=environment_flag("FATTERVOICE_WYOMING_ENABLED", True),
-        help="Enable or disable the Wyoming protocol server.",
+        "--wyoming-host",
+        default=environment_default("FATTERVOICE_WYOMING_HOST", "0.0.0.0"),
+        help="Wyoming TCP bind host.",
     )
     parser.add_argument(
-        "--wyoming-uri",
-        default=environment_default("FATTERVOICE_WYOMING_URI", "tcp://0.0.0.0:10300"),
-        help="Wyoming server URI such as tcp://0.0.0.0:10300 or unix:///tmp/fattervoice.sock.",
+        "--wyoming-port",
+        type=int,
+        default=int(environment_default("FATTERVOICE_WYOMING_PORT", "10300")),
+        help="Wyoming TCP bind port.",
     )
     parser.add_argument(
         "--log-level",
@@ -235,7 +361,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 
-def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
+def parse_server_config(argv: Sequence[str] | None = None) -> ServerConfig:
     """Parse CLI arguments and normalize them into the immutable runtime config.
 
     Usage:
@@ -256,10 +382,8 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
 
-    if args.port <= 0:
-        parser.error("--port must be a positive integer.")
-    if args.max_text_length <= 0:
-        parser.error("--max-text-length must be a positive integer.")
+    if args.openapi_port <= 0:
+        parser.error("--openapi-port must be a positive integer.")
     if args.num_step <= 0:
         parser.error("--num-step must be a positive integer.")
     if args.guidance_scale < 0.0:
@@ -274,24 +398,18 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         parser.error("--audio-chunk-duration must be greater than zero.")
     if args.audio_chunk_threshold <= 0.0:
         parser.error("--audio-chunk-threshold must be greater than zero.")
-
-    wyoming_uri: Optional[str] = args.wyoming_uri
-    if args.wyoming_enabled and not wyoming_uri:
-        parser.error("--wyoming-uri must be set when Wyoming support is enabled.")
-    if not args.wyoming_enabled:
-        wyoming_uri = None
+    if args.wyoming_port <= 0:
+        parser.error("--wyoming-port must be a positive integer.")
 
     return ServerConfig(
         voices_dir=Path(args.voices_dir).expanduser().resolve(),
-        host=args.host,
-        port=args.port,
-        model=args.model,
+        openapi_host=args.openapi_host,
+        openapi_port=args.openapi_port,
         device=args.device,
         dtype=args.dtype,
         default_language=args.default_language,
-        max_text_length=args.max_text_length,
-        wyoming_enabled=args.wyoming_enabled,
-        wyoming_uri=wyoming_uri,
+        wyoming_host=args.wyoming_host,
+        wyoming_port=args.wyoming_port,
         log_level=args.log_level.upper(),
         num_step=args.num_step,
         guidance_scale=args.guidance_scale,

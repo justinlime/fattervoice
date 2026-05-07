@@ -481,21 +481,17 @@ async def run_wyoming_server(
     """Start the Wyoming server and block while it serves client connections.
 
     Usage:
-        The main runtime starts this coroutine alongside the HTTP server when the
-        user has enabled Wyoming support.
+        The main runtime starts this coroutine alongside the HTTP server because
+        Wyoming support is now always enabled for the production server.
 
     Parameters:
         service: Shared synthesis service used by every connection handler.
         voice_registry: Shared validated voice registry.
-        config: Immutable runtime configuration containing the Wyoming URI.
+        config: Immutable runtime configuration containing the Wyoming host/port settings.
 
     Returns:
         None. The coroutine runs until the process is stopped.
     """
-    if not config.wyoming_enabled or not config.wyoming_uri:
-        LOGGER.info("Wyoming support is disabled")
-        return
-
     wyoming_info = build_wyoming_info(voice_registry)
     handler_factory = partial(
         FatterVoiceWyomingHandler,
