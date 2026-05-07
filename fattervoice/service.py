@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -15,9 +16,9 @@ from sentence_stream import SentenceBoundaryDetector
 
 from .audio import audio_to_pcm16_bytes, iter_byte_chunks
 from .config import ServerConfig
-from .hf_cache import configure_huggingface_cache, is_huggingface_offline_mode_enabled
+from .hf_cache import is_huggingface_offline_mode_enabled
 from .model_catalog import resolve_model_id
-from .prefetch_manifest import resolve_prefetched_model_path
+from .prefetch_manifest import resolve_cached_model_snapshot_path
 from .voice_registry import VoiceEntry, VoiceRegistry
 
 LOGGER = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ _STREAMING_PCM_CHUNK_BYTES = 8192
 
 @dataclass(frozen=True)
 class CachedVoiceClonePrompt:
-    """Cached OmniVoice prompt object for one validated voice registry entry."""
+    """CPU-resident OmniVoice prompt object cached for one validated voice entry."""
 
     voice_id: str
     prompt: object
@@ -40,6 +41,55 @@ class SynthesisRequest:
     voice_id: str | None = None
     language: str | None = None
     speed: float | None = None
+
+
+
+def move_prompt_value_to_cpu(value: object) -> object:
+    """Recursively copy tensor-bearing prompt values onto CPU memory.
+
+    Usage:
+        OmniVoice prompt objects may contain GPU tensors even though only one
+        request can actively generate at a time. This helper converts cached
+        prompt payloads into CPU-resident structures so previously used voices
+        can be reused later without continuing to pin VRAM between requests.
+
+    Parameters:
+        value: Any prompt payload object, including dataclasses, dictionaries,
+            lists, tuples, tensors, or primitive values.
+
+    Returns:
+        A deep-copied prompt payload where any tensor leaves have been detached
+        and moved to CPU memory. Non-tensor values are preserved.
+    """
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is a runtime dependency in production.
+        torch = None
+
+    if torch is not None and torch.is_tensor(value):
+        return value.detach().cpu()
+
+    if is_dataclass(value) and not isinstance(value, type):
+        return value.__class__(
+            **{
+                field.name: move_prompt_value_to_cpu(getattr(value, field.name))
+                for field in fields(value)
+            }
+        )
+
+    if isinstance(value, dict):
+        return {
+            key: move_prompt_value_to_cpu(nested_value)
+            for key, nested_value in value.items()
+        }
+
+    if isinstance(value, list):
+        return [move_prompt_value_to_cpu(item) for item in value]
+
+    if isinstance(value, tuple):
+        return tuple(move_prompt_value_to_cpu(item) for item in value)
+
+    return value
 
 
 
@@ -176,22 +226,29 @@ class TtsService:
         self._model_lock = threading.Lock()
         self._prepared_voice_lock = threading.Lock()
         self._prepared_voice_cache: dict[str, CachedVoiceClonePrompt] = {}
+        self._last_generated_voice_id: str | None = None
 
     def close(self) -> None:
-        """Release cached prompt state owned by the synthesis service.
+        """Release cached prompt state and unused accelerator memory.
 
         Usage:
-            Tests or future shutdown hooks can call this method to drop cached
-            voice-clone prompt objects during teardown.
+            Tests or future shutdown hooks can call this method during teardown
+            so cached prompt objects are dropped and any unused accelerator cache
+            is released before the process exits.
 
         Parameters:
             None.
 
         Returns:
-            None. Cached prompt objects are cleared in place.
+            None. Cached prompt objects are cleared in place and best-effort
+            accelerator cleanup is performed.
         """
         with self._prepared_voice_lock:
             self._prepared_voice_cache.clear()
+
+        with self._model_lock:
+            self._last_generated_voice_id = None
+            self._release_unused_accelerator_memory()
 
     @property
     def sample_rate(self) -> int:
@@ -383,8 +440,6 @@ class TtsService:
         if self._model is not None:
             return
 
-        configure_huggingface_cache(self.config.model_cache_dir)
-
         import torch
         from omnivoice import OmniVoice
 
@@ -395,21 +450,8 @@ class TtsService:
                 f"Unsupported torch dtype {self.config.dtype!r}."
             ) from exc
 
-        model_source = resolve_prefetched_model_path(
-            self.model_id,
-            self.config.prefetch_manifest_path,
-            self.config.model_cache_dir,
-        )
+        model_source = resolve_cached_model_snapshot_path(self.model_id, None)
         resolved_model_path = Path(model_source).expanduser()
-        if (
-            self.config.prefetch_manifest_path is not None
-            and model_source == self.model_id
-        ):
-            LOGGER.warning(
-                "Prefetch manifest %s did not resolve a local snapshot path for %s; falling back to Hugging Face cache inspection / model ID loading.",
-                self.config.prefetch_manifest_path,
-                self.model_id,
-            )
 
         if is_huggingface_offline_mode_enabled() and not resolved_model_path.exists():
             build_model_selection_hint = os.environ.get("MODEL_SELECTION_HINT", "").strip()
@@ -427,7 +469,7 @@ class TtsService:
                     )
             raise FileNotFoundError(
                 "Offline mode is enabled, but no local snapshot path could be resolved for "
-                f"{self.model_id!r}. Check FATTERVOICE_PREFETCH_MANIFEST and the Hugging Face hub cache contents."
+                f"{self.model_id!r}. Check the Hugging Face hub cache contents."
             )
 
         LOGGER.info(
@@ -466,6 +508,37 @@ class TtsService:
             raise RuntimeError("The TTS model has not been loaded yet.")
         return self._model
 
+    def _release_unused_accelerator_memory(self) -> None:
+        """Release unused accelerator cache after prompt or voice transitions.
+
+        Usage:
+            The synthesis service calls this helper when it has already dropped
+            Python references to GPU-backed prompt data or when it is switching
+            away from a previously generated voice. This keeps large prompt-driven
+            VRAM high-water marks from lingering longer than necessary.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The helper performs best-effort garbage collection and, when
+            available, releases unused accelerator cache blocks back to the
+            runtime.
+        """
+        gc.collect()
+
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - torch is a runtime dependency in production.
+            return
+
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            return
+
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache") and torch.mps.is_available():
+            torch.mps.empty_cache()
+
     def _resolve_cached_voice_clone_prompt(
         self,
         voice: VoiceEntry,
@@ -475,9 +548,10 @@ class TtsService:
         Usage:
             Buffered and streaming synthesis both call this helper so a voice
             prompt is built lazily on first use and then reused for later
-            requests. To keep memory use predictable, the service retains only
-            the most recently used voice prompt cache entry and discards any
-            previously cached voice when a different voice is requested.
+            requests. Cached prompts are stored in CPU memory so previously used
+            voices do not keep VRAM pinned between requests, while still avoiding
+            repeated reference-audio tokenization when users swap back to an
+            earlier voice.
 
         Parameters:
             voice: The validated voice entry selected for the current request.
@@ -491,15 +565,6 @@ class TtsService:
             if cached_voice is not None:
                 return cached_voice
 
-            if self._prepared_voice_cache:
-                evicted_voice_ids = sorted(self._prepared_voice_cache)
-                LOGGER.info(
-                    "Discarding cached OmniVoice prompt entries for %s before caching voice %s",
-                    ", ".join(evicted_voice_ids),
-                    voice.voice_id,
-                )
-                self._prepared_voice_cache.clear()
-
             LOGGER.info("Creating lazy OmniVoice prompt cache entry for voice %s", voice.voice_id)
             with self._model_lock:
                 prompt = self._require_model().create_voice_clone_prompt(
@@ -508,7 +573,12 @@ class TtsService:
                     preprocess_prompt=self.config.preprocess_voice_clone_prompt,
                 )
 
-            cached_voice = CachedVoiceClonePrompt(voice_id=voice.voice_id, prompt=prompt)
+            cpu_prompt = move_prompt_value_to_cpu(prompt)
+            del prompt
+            cached_voice = CachedVoiceClonePrompt(
+                voice_id=voice.voice_id,
+                prompt=cpu_prompt,
+            )
             self._prepared_voice_cache[voice.voice_id] = cached_voice
             return cached_voice
 
@@ -560,10 +630,19 @@ class TtsService:
         cached_voice = self._resolve_cached_voice_clone_prompt(voice)
         generation_kwargs = self._build_generation_kwargs(request, cached_voice)
         with self._model_lock:
+            if (
+                self._last_generated_voice_id is not None
+                and self._last_generated_voice_id != voice.voice_id
+            ):
+                self._release_unused_accelerator_memory()
+
             audio_list = self._require_model().generate(**generation_kwargs)
+            self._last_generated_voice_id = voice.voice_id
 
         waveform = audio_list[0] if audio_list else np.zeros(0, dtype=np.float32)
-        return coerce_waveform_array(waveform), self.sample_rate
+        normalized_waveform = coerce_waveform_array(waveform)
+        del audio_list
+        return normalized_waveform, self.sample_rate
 
     def _build_generation_kwargs(
         self,

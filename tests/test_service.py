@@ -14,7 +14,7 @@ from unittest.mock import patch
 import numpy as np
 
 from fattervoice.config import ServerConfig
-from fattervoice.service import SynthesisRequest, TtsService
+from fattervoice.service import CachedVoiceClonePrompt, SynthesisRequest, TtsService
 from fattervoice.voice_registry import VoiceEntry
 
 
@@ -175,11 +175,8 @@ def build_test_config(temp_dir: str, **overrides: object) -> ServerConfig:
         "dtype": "float16",
         "default_language": "auto",
         "max_text_length": 4000,
-        "model_cache_dir": None,
-        "prefetch_manifest_path": None,
         "wyoming_enabled": True,
         "wyoming_uri": "tcp://0.0.0.0:10300",
-        "wyoming_audio_chunk_samples": 4096,
         "log_level": "INFO",
         "num_step": 16,
         "guidance_scale": 2.0,
@@ -294,8 +291,7 @@ class TtsServiceTests(unittest.TestCase):
             )
 
             with (
-                patch("fattervoice.service.configure_huggingface_cache", return_value=None),
-                patch("fattervoice.service.resolve_prefetched_model_path", return_value=str(local_model_path)),
+                patch("fattervoice.service.resolve_cached_model_snapshot_path", return_value=str(local_model_path)),
                 patch("fattervoice.service.is_huggingface_offline_mode_enabled", return_value=False),
                 patch.dict(
                     sys.modules,
@@ -340,8 +336,7 @@ class TtsServiceTests(unittest.TestCase):
             )
 
             with (
-                patch("fattervoice.service.configure_huggingface_cache", return_value=None),
-                patch("fattervoice.service.resolve_prefetched_model_path", return_value=service.model_id),
+                patch("fattervoice.service.resolve_cached_model_snapshot_path", return_value=service.model_id),
                 patch("fattervoice.service.is_huggingface_offline_mode_enabled", return_value=True),
                 patch.dict(
                     sys.modules,
@@ -387,20 +382,19 @@ class TtsServiceTests(unittest.TestCase):
         self.assertEqual(len(fake_model.created_prompts), 0)
         self.assertEqual(service._prepared_voice_cache, {})
 
-    def test_synthesize_keeps_only_the_most_recent_voice_prompt_cached(self) -> None:
-        """Ensure the service retains only the last-used voice prompt cache entry.
+    def test_synthesize_reuses_cached_voice_prompts_across_voice_swaps(self) -> None:
+        """Ensure each voice prompt is prepared once and reused after later swaps.
 
         Usage:
-            Constraining the cache to one entry keeps VRAM and RAM growth
-            predictable when many voices are configured. This test verifies that
-            switching voices evicts the older cached prompt, and switching back
-            recreates it on demand.
+            The service now keeps cached prompt data in CPU memory so previously
+            used voices can be reused without repeating reference-audio
+            tokenization every time a user alternates between voices.
 
         Parameters:
             None.
 
         Returns:
-            None. The test asserts on cache eviction and prompt recreation.
+            None. The test asserts on prompt creation count and cached voice IDs.
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_model = FakeOmniVoiceModel()
@@ -422,12 +416,12 @@ class TtsServiceTests(unittest.TestCase):
 
             asyncio.run(run_test())
 
-        self.assertEqual(len(fake_model.created_prompts), 3)
+        self.assertEqual(len(fake_model.created_prompts), 2)
         self.assertEqual(
             [Path(prompt["ref_audio"]).stem for prompt in fake_model.created_prompts],
-            ["demo", "other", "demo"],
+            ["demo", "other"],
         )
-        self.assertEqual(sorted(service._prepared_voice_cache), ["demo"])
+        self.assertEqual(sorted(service._prepared_voice_cache), ["demo", "other"])
 
     def test_synthesize_reuses_cached_voice_prompt_and_normalizes_language(self) -> None:
         """Ensure repeated synthesis requests reuse one cached OmniVoice prompt.
@@ -480,6 +474,79 @@ class TtsServiceTests(unittest.TestCase):
             fake_model.generated_requests[0]["voice_clone_prompt"],
             fake_model.generated_requests[1]["voice_clone_prompt"],
         )
+
+    def test_synthesize_releases_unused_accelerator_memory_when_switching_voices(self) -> None:
+        """Ensure voice changes trigger best-effort accelerator cache cleanup.
+
+        Usage:
+            Large reference prompts can leave the CUDA caching allocator holding
+            onto a previous voice's high-water mark. This regression test
+            verifies that the service runs its cleanup hook when generation
+            switches to a different voice, while avoiding extra cleanup for
+            repeated requests to the same voice.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts on cleanup-hook call counts across repeated
+            same-voice and cross-voice requests.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_model = FakeOmniVoiceModel()
+            service = TtsService(
+                config=build_test_config(temp_dir),
+                voice_registry=FakeVoiceRegistry(
+                    [
+                        build_test_voice_entry(temp_dir, voice_id="demo"),
+                        build_test_voice_entry(temp_dir, voice_id="other"),
+                    ]
+                ),
+            )
+            service._model = fake_model
+
+            with patch.object(service, "_release_unused_accelerator_memory") as release_memory:
+                async def run_test() -> None:
+                    await service.synthesize(SynthesisRequest(text="First", voice_id="demo"))
+                    await service.synthesize(SynthesisRequest(text="Second", voice_id="demo"))
+                    await service.synthesize(SynthesisRequest(text="Third", voice_id="other"))
+
+                asyncio.run(run_test())
+
+        self.assertEqual(release_memory.call_count, 1)
+
+    def test_close_clears_cached_prompts_and_releases_unused_accelerator_memory(self) -> None:
+        """Ensure service shutdown clears cached prompts and runs cleanup once.
+
+        Usage:
+            Runtime shutdown should drop any cached prompt references and release
+            any unused accelerator cache so long-lived servers can stop cleanly
+            without leaving stale prompt state behind.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that cached prompts are cleared, the last
+            generated voice marker is reset, and the cleanup hook runs once.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = TtsService(
+                config=build_test_config(temp_dir),
+                voice_registry=FakeVoiceRegistry([build_test_voice_entry(temp_dir)]),
+            )
+            service._prepared_voice_cache["demo"] = CachedVoiceClonePrompt(
+                voice_id="demo",
+                prompt={"ref_audio": "demo.wav"},
+            )
+            service._last_generated_voice_id = "demo"
+
+            with patch.object(service, "_release_unused_accelerator_memory") as release_memory:
+                service.close()
+
+        self.assertEqual(service._prepared_voice_cache, {})
+        self.assertIsNone(service._last_generated_voice_id)
+        release_memory.assert_called_once_with()
 
     def test_stream_low_latency_pcm_chunks_synthesizes_sentence_segments_separately(self) -> None:
         """Ensure explicit low-latency streaming reuses cached prompts across segments.

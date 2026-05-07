@@ -29,6 +29,9 @@ from .voice_registry import VoiceRegistry
 
 LOGGER = logging.getLogger(__name__)
 
+_HARDCODED_WYOMING_AUDIO_CHUNK_SAMPLES = 4096
+_HARDCODED_WYOMING_AUDIO_CHUNK_BYTES = _HARDCODED_WYOMING_AUDIO_CHUNK_SAMPLES * 2
+
 _WYOMING_LANGUAGE_TAG_ALIASES = {
     "auto": None,
     "de": "de",
@@ -115,7 +118,6 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
         self,
         service: TtsService,
         voice_registry: VoiceRegistry,
-        config: ServerConfig,
         info_event: Event,
         *args,
         **kwargs,
@@ -129,7 +131,6 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
         Parameters:
             service: Shared synthesis service used for all audio generation.
             voice_registry: Shared validated voice registry.
-            config: Immutable runtime configuration.
             info_event: Prebuilt Wyoming `info` event used to answer `describe`.
             *args: Positional arguments forwarded to `AsyncEventHandler`.
             **kwargs: Keyword arguments forwarded to `AsyncEventHandler`.
@@ -140,7 +141,6 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
         super().__init__(*args, **kwargs)
         self.service = service
         self.voice_registry = voice_registry
-        self.config = config
         self.info_event = info_event
         self._sentence_detector = SentenceBoundaryDetector()
         self._stream_voice: Optional[SynthesizeVoice] = None
@@ -214,7 +214,7 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
         )
         for chunk_payload in iter_byte_chunks(
             pcm_payload,
-            self.config.wyoming_audio_chunk_samples * 2,
+            _HARDCODED_WYOMING_AUDIO_CHUNK_BYTES,
         ):
             await self.write_event(
                 AudioChunk(
@@ -331,7 +331,6 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
             return audio_started
 
         synthesis_request = self._build_synthesis_request(normalized_sentence, voice)
-        bytes_per_chunk = self.config.wyoming_audio_chunk_samples * 2
 
         async for pcm_chunk in self.service.stream_pcm_chunks(synthesis_request):
             if not audio_started:
@@ -344,7 +343,7 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
                 )
                 audio_started = True
 
-            for chunk_payload in iter_byte_chunks(pcm_chunk, bytes_per_chunk):
+            for chunk_payload in iter_byte_chunks(pcm_chunk, _HARDCODED_WYOMING_AUDIO_CHUNK_BYTES):
                 await self.write_event(
                     AudioChunk(
                         audio=chunk_payload,
@@ -502,7 +501,6 @@ async def run_wyoming_server(
         FatterVoiceWyomingHandler,
         service,
         voice_registry,
-        config,
         wyoming_info.event(),
     )
     LOGGER.info("Starting Wyoming server on %s", config.wyoming_uri)

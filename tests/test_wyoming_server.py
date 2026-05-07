@@ -7,7 +7,6 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
-from types import SimpleNamespace
 
 from fattervoice.voice_registry import VoiceRegistry
 
@@ -150,11 +149,9 @@ if WYOMING_IMPORT_ERROR is None:
             """
             voice_registry = self._create_voice_registry()
             fake_service = service or FakeStreamingService()
-            config = SimpleNamespace(wyoming_audio_chunk_samples=16)
             return RecordingWyomingHandler(
                 fake_service,
                 voice_registry,
-                config,
                 build_wyoming_info(voice_registry).event(),
             )
 

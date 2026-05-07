@@ -33,19 +33,15 @@ WORKDIR /app
 # dependency metadata and the small prefetch helper surface.
 COPY pyproject.toml uv.lock /app/
 COPY fattervoice/__init__.py /app/fattervoice/__init__.py
-COPY fattervoice/hf_cache.py /app/fattervoice/hf_cache.py
 COPY fattervoice/model_catalog.py /app/fattervoice/model_catalog.py
 COPY fattervoice/prefetch.py /app/fattervoice/prefetch.py
-COPY fattervoice/prefetch_manifest.py /app/fattervoice/prefetch_manifest.py
 
 RUN uv sync --extra mp3 --no-install-project
 
 # Prefetch the selected OmniVoice assets during the image build so runtime stays offline.
 RUN mkdir -p /opt/fattervoice/voices /opt/torchinductor && \
     uv run --no-sync python -m fattervoice.prefetch \
-    --model "${MODEL_SELECTION}" \
-    --cache-dir "${HF_HUB_CACHE}" \
-    --manifest /opt/fattervoice/prefetched-models.json
+    --model "${MODEL_SELECTION}"
 
 COPY README.md /app/README.md
 COPY fattervoice /app/fattervoice
@@ -59,8 +55,6 @@ ENV FATTERVOICE_VOICES_DIR=/opt/fattervoice/voices \
     FATTERVOICE_PORT=8000 \
     FATTERVOICE_WYOMING_ENABLED=true \
     FATTERVOICE_WYOMING_URI=tcp://0.0.0.0:10300 \
-    FATTERVOICE_MODEL_CACHE_DIR=/opt/huggingface/hub \
-    FATTERVOICE_PREFETCH_MANIFEST=/opt/fattervoice/prefetched-models.json \
     MODEL_SELECTION_HINT=${MODEL_SELECTION} \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1

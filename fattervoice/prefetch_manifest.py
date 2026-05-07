@@ -1,77 +1,31 @@
-"""Helpers for recording and resolving exact local paths for prefetched models."""
+"""Helpers for resolving prefetched Hugging Face model snapshots from the local cache."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Optional
 
 
 
-def write_prefetch_manifest(model_paths: dict[str, Path], manifest_path: Path) -> Path:
-    """Write a manifest that maps remote model IDs to local prefetched snapshot paths.
+def resolve_snapshot_directory_from_cached_file(cached_file_path: str) -> Path:
+    """Derive the containing snapshot directory from one cached Hugging Face file path.
 
     Usage:
-        Docker builds and manual prefetch commands call this helper after models
-        have been downloaded so runtime startup can resolve an exact local model
-        directory instead of relying only on Hugging Face cache discovery.
+        `try_to_load_from_cache(...)` returns a cached file path, which in the
+        standard Hugging Face cache layout usually lives under
+        `snapshots/<revision>/...` and may itself be a symlink into `blobs/`.
+        This helper intentionally takes the parent directory before resolving the
+        path so the snapshot directory is preserved instead of collapsing into
+        the shared blob store.
 
     Parameters:
-        model_paths: A mapping from concrete model IDs such as
-            `k2-fsa/OmniVoice` or `eustlb/higgs-audio-v2-tokenizer` to the local
-            snapshot directories returned by `snapshot_download(...)`.
-        manifest_path: The JSON file path that should receive the manifest.
+        cached_file_path: The cached file path returned by Hugging Face cache
+            lookup helpers.
 
     Returns:
-        The resolved manifest path that was written to disk.
+        The resolved snapshot directory that contains the cached file path.
     """
-    resolved_manifest_path = manifest_path.expanduser().resolve()
-    resolved_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    serialized_manifest = {
-        "model_paths": {
-            model_id: str(model_path.expanduser().resolve())
-            for model_id, model_path in sorted(model_paths.items())
-        }
-    }
-    resolved_manifest_path.write_text(
-        json.dumps(serialized_manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return resolved_manifest_path
-
-
-
-def read_prefetch_manifest(manifest_path: Optional[Path]) -> dict[str, str]:
-    """Load a prefetched-model manifest from disk if one is available.
-
-    Usage:
-        Runtime model resolution calls this helper before startup so offline
-        containers can map remote model IDs onto already-downloaded snapshot paths.
-
-    Parameters:
-        manifest_path: The optional JSON file path to read.
-
-    Returns:
-        A mapping from concrete model IDs to local snapshot path strings. When the
-        file is missing or no path is provided, an empty mapping is returned.
-    """
-    if manifest_path is None:
-        return {}
-
-    resolved_manifest_path = manifest_path.expanduser().resolve()
-    if not resolved_manifest_path.exists():
-        return {}
-
-    manifest_data = json.loads(resolved_manifest_path.read_text(encoding="utf-8"))
-    model_paths = manifest_data.get("model_paths", {})
-    if not isinstance(model_paths, dict):
-        return {}
-
-    return {
-        str(model_id): str(model_path)
-        for model_id, model_path in model_paths.items()
-        if isinstance(model_id, str) and isinstance(model_path, str)
-    }
+    return Path(cached_file_path).expanduser().parent.resolve()
 
 
 
@@ -79,18 +33,27 @@ def resolve_cached_model_snapshot_path(model_id: str, cache_dir: Optional[Path])
     """Resolve a model ID to a cached local snapshot path using Hugging Face cache helpers.
 
     Usage:
-        Runtime startup calls this helper as a fallback when no explicit manifest
-        entry is available. It uses Hugging Face cache inspection utilities that
-        do not perform network requests.
+        Runtime startup calls this helper to find an already-downloaded local
+        snapshot directory without making network requests. The wrapper now uses
+        cache inspection only and no longer depends on a separate prefetch
+        manifest file.
 
     Parameters:
-        model_id: The concrete Hugging Face model ID that should be resolved.
+        model_id: The concrete Hugging Face model ID or local filesystem path
+            that should be resolved.
         cache_dir: The optional Hugging Face hub cache directory to inspect.
+            When `None`, the active Hugging Face default cache configuration is
+            used.
 
     Returns:
         The resolved local snapshot directory when one can be located in the
-        cache; otherwise the original `model_id` string.
+        cache or when `model_id` already points at an existing local path;
+        otherwise the original `model_id` string.
     """
+    candidate_path = Path(model_id).expanduser()
+    if candidate_path.exists():
+        return str(candidate_path.resolve())
+
     resolved_cache_dir = cache_dir.expanduser().resolve() if cache_dir is not None else None
 
     try:
@@ -106,7 +69,9 @@ def resolve_cached_model_snapshot_path(model_id: str, cache_dir: Optional[Path])
         repo_type="model",
     )
     if isinstance(cached_config_path, str):
-        return str(Path(cached_config_path).expanduser().resolve().parent)
+        cached_snapshot_path = resolve_snapshot_directory_from_cached_file(cached_config_path)
+        if cached_snapshot_path.name != "blobs" and cached_snapshot_path.exists():
+            return str(cached_snapshot_path)
 
     try:
         cache_info = scan_cache_dir(str(resolved_cache_dir) if resolved_cache_dir is not None else None)
@@ -143,37 +108,3 @@ def resolve_cached_model_snapshot_path(model_id: str, cache_dir: Optional[Path])
 
     latest_revision = max(existing_revisions, key=lambda cached_revision: cached_revision.last_modified)
     return str(latest_revision.snapshot_path.expanduser().resolve())
-
-
-
-def resolve_prefetched_model_path(
-    model_id: str,
-    manifest_path: Optional[Path],
-    cache_dir: Optional[Path],
-) -> str:
-    """Resolve a model ID to a local snapshot path using manifest data or cache inspection.
-
-    Usage:
-        Server startup calls this helper after normal alias resolution so offline
-        containers can load an exact local snapshot directory recorded during the
-        image build, while still having a robust fallback to Hugging Face cache
-        inspection if the manifest is missing or stale.
-
-    Parameters:
-        model_id: The concrete model ID or local path selected for runtime use.
-        manifest_path: The optional manifest path written during prefetch.
-        cache_dir: The optional Hugging Face hub cache directory to inspect when
-            the manifest does not provide a usable path.
-
-    Returns:
-        The local snapshot path when one can be resolved locally; otherwise the
-        original `model_id` string.
-    """
-    prefetched_model_paths = read_prefetch_manifest(manifest_path)
-    prefetched_path = prefetched_model_paths.get(model_id)
-    if prefetched_path is not None:
-        resolved_prefetched_path = Path(prefetched_path).expanduser().resolve()
-        if resolved_prefetched_path.exists():
-            return str(resolved_prefetched_path)
-
-    return resolve_cached_model_snapshot_path(model_id, cache_dir)

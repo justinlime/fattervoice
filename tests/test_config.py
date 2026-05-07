@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from fattervoice.config import parse_server_config
 
@@ -14,42 +12,40 @@ from fattervoice.config import parse_server_config
 class ServerConfigTests(unittest.TestCase):
     """Verify that runtime configuration honors the documented CLI and env contract."""
 
-    def test_parse_server_config_uses_huggingface_cache_environment_fallbacks(self) -> None:
-        """Ensure runtime startup can reuse the Docker image's Hugging Face cache env vars.
+    def test_parse_server_config_rejects_removed_cache_and_manifest_flags(self) -> None:
+        """Ensure removed cache-related CLI flags now fail fast during parsing.
 
         Usage:
-            The Docker image sets standard Hugging Face cache environment variables
-            even when `FATTERVOICE_MODEL_CACHE_DIR` is not explicitly provided.
-            This test verifies that runtime config parsing still resolves the same
-            cache directory so offline startup can inspect the prefetched cache.
+            The wrapper no longer exposes cache-path or prefetch-manifest server
+            options, so this regression test verifies that operators get an
+            argparse failure instead of a silently ignored flag.
 
         Parameters:
             None.
 
         Returns:
-            None. The test asserts that the parsed config points at the cache
-            directory declared through `HF_HUB_CACHE`.
+            None. The test asserts that argparse raises `SystemExit` for each
+            removed flag.
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             voices_dir = Path(temp_dir) / "voices"
             voices_dir.mkdir()
-            cache_dir = Path(temp_dir) / "huggingface" / "hub"
-            with patch.dict(
-                os.environ,
-                {
-                    "HF_HUB_CACHE": str(cache_dir),
-                    "FATTERVOICE_MODEL_CACHE_DIR": "",
-                    "HUGGINGFACE_HUB_CACHE": "",
-                    "TRANSFORMERS_CACHE": "",
-                },
-                clear=True,
-            ):
-                server_config = parse_server_config([
+
+            with self.assertRaises(SystemExit):
+                parse_server_config([
                     "--voices-dir",
                     str(voices_dir),
+                    "--model-cache-dir",
+                    "/tmp/hf-cache",
                 ])
 
-            self.assertEqual(server_config.model_cache_dir, cache_dir.resolve())
+            with self.assertRaises(SystemExit):
+                parse_server_config([
+                    "--voices-dir",
+                    str(voices_dir),
+                    "--prefetch-manifest",
+                    "/tmp/prefetched-models.json",
+                ])
 
     def test_parse_server_config_supports_omnivoice_generation_flags(self) -> None:
         """Ensure the OmniVoice runtime knobs can be configured through the CLI.
@@ -126,6 +122,32 @@ class ServerConfigTests(unittest.TestCase):
                     "--voices-dir",
                     str(voices_dir),
                     "--warmup",
+                ])
+
+    def test_parse_server_config_rejects_removed_wyoming_chunk_flag(self) -> None:
+        """Ensure the removed Wyoming chunk-size flag is no longer accepted.
+
+        Usage:
+            Wyoming audio chunk sizing is now hardcoded, so this regression test
+            verifies that old deployments fail fast if they still pass the removed
+            override flag.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that argparse raises `SystemExit`.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voices_dir = Path(temp_dir) / "voices"
+            voices_dir.mkdir()
+
+            with self.assertRaises(SystemExit):
+                parse_server_config([
+                    "--voices-dir",
+                    str(voices_dir),
+                    "--wyoming-audio-chunk-samples",
+                    "2048",
                 ])
 
 

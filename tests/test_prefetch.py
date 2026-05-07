@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -10,31 +9,54 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fattervoice.prefetch import main as run_prefetch_cli
+
 
 class PrefetchCliTests(unittest.TestCase):
     """Verify that the prefetch module can be executed directly during Docker builds."""
 
-    def test_python_module_invocation_runs_prefetch_main_and_writes_manifest(self) -> None:
+    def test_prefetch_cli_rejects_removed_cache_and_manifest_flags(self) -> None:
+        """Ensure removed prefetch CLI flags now fail fast during parsing.
+
+        Usage:
+            The wrapper no longer exposes custom cache-dir or manifest flags on
+            the prefetch helper, so this regression test verifies that old
+            invocation patterns now raise `SystemExit` instead of being silently
+            accepted.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that argparse raises `SystemExit` for each
+            removed flag.
+        """
+        with self.assertRaises(SystemExit):
+            run_prefetch_cli(["--cache-dir", "/tmp/hf-cache"])
+
+        with self.assertRaises(SystemExit):
+            run_prefetch_cli(["--manifest", "/tmp/prefetched-models.json"])
+
+    def test_python_module_invocation_runs_prefetch_main(self) -> None:
         """Ensure `python -m fattervoice.prefetch` performs the requested work.
 
         Usage:
             The Dockerfile invokes the prefetch helper as a Python module before
             the project itself is installed as a console script. This test guards
             that path by executing the module in a subprocess and asserting that
-            it writes the requested manifest for a local model directory.
+            it resolves a local model directory without trying to write any extra
+            wrapper-managed manifest.
 
         Parameters:
             None.
 
         Returns:
-            None. The test asserts on the subprocess exit code, stdout, and
-            manifest contents.
+            None. The test asserts on the subprocess exit code and stdout.
         """
         repository_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temp_dir:
             local_model_path = Path(temp_dir) / "local-model"
             local_model_path.mkdir()
-            manifest_path = Path(temp_dir) / "prefetched-models.json"
             stub_module_root = Path(temp_dir) / "stubs"
             stub_module_root.mkdir()
             (stub_module_root / "huggingface_hub.py").write_text(
@@ -60,8 +82,6 @@ class PrefetchCliTests(unittest.TestCase):
                     "fattervoice.prefetch",
                     "--model",
                     str(local_model_path),
-                    "--manifest",
-                    str(manifest_path),
                 ],
                 capture_output=True,
                 check=False,
@@ -73,15 +93,6 @@ class PrefetchCliTests(unittest.TestCase):
             self.assertEqual(completed_process.returncode, 0, completed_process.stderr)
             self.assertEqual(completed_process.stderr, "")
             self.assertIn(str(local_model_path.resolve()), completed_process.stdout)
-            self.assertTrue(manifest_path.exists())
-            self.assertEqual(
-                json.loads(manifest_path.read_text(encoding="utf-8")),
-                {
-                    "model_paths": {
-                        str(local_model_path): str(local_model_path.resolve()),
-                    }
-                },
-            )
 
 
 if __name__ == "__main__":

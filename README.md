@@ -80,20 +80,19 @@ CLI arguments take precedence, and environment variables act as fallbacks.
 | `--postprocess-output-audio` / `--no-postprocess-output-audio` | `FATTERVOICE_POSTPROCESS_OUTPUT_AUDIO` | `true` |
 | `--audio-chunk-duration` | `FATTERVOICE_AUDIO_CHUNK_DURATION` | `15.0` |
 | `--audio-chunk-threshold` | `FATTERVOICE_AUDIO_CHUNK_THRESHOLD` | `30.0` |
-| `--model-cache-dir` | `FATTERVOICE_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
-| `--prefetch-manifest` | `FATTERVOICE_PREFETCH_MANIFEST` | empty / unset |
 | `--wyoming-enabled` / `--no-wyoming-enabled` | `FATTERVOICE_WYOMING_ENABLED` | `true` |
 | `--wyoming-uri` | `FATTERVOICE_WYOMING_URI` | `tcp://0.0.0.0:10300` |
-| `--wyoming-audio-chunk-samples` | `FATTERVOICE_WYOMING_AUDIO_CHUNK_SAMPLES` | `4096` |
 | `--log-level` | `FATTERVOICE_LOG_LEVEL` | `INFO` |
 
 Boolean environment variables accept `1`, `true`, `yes`, or `on` for true, and `0`, `false`, `no`, or `off` for false.
+
+Wyoming audio chunking is now fixed at `4096` mono PCM samples per emitted `audio-chunk`, and model-cache / prefetch-manifest selection is no longer exposed through wrapper-specific server flags.
 
 ### OmniVoice tuning defaults
 
 The server is tuned for **fast voice cloning with strong retained quality**:
 
-- voice-clone prompts are cached lazily on first use, and only the most recently used voice prompt remains cached to keep memory usage predictable
+- voice-clone prompts are cached lazily on first use and retained in CPU memory so previously used voices can be reused without re-tokenizing their reference audio while inactive voices stop pinning VRAM between requests
 - `num_step=16` is the default speed-focused OmniVoice setting
 - reference transcripts remain mandatory for stable cloning and offline operation
 - OmniVoice prompt preprocessing and output postprocessing remain enabled by default
@@ -158,19 +157,8 @@ This command also prefetches the auxiliary Higgs audio tokenizer repository requ
 | CLI flag | ENV fallback | Default |
 | --- | --- | --- |
 | `--model` | — | `omnivoice` |
-| `--cache-dir` | `FATTERVOICE_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
-| `--manifest` | `FATTERVOICE_PREFETCH_MANIFEST` | empty / unset |
 
-When you pass `--cache-dir`, use the actual Hugging Face hub cache directory that `from_pretrained(...)` will read from. In the Docker image, that path is `/opt/huggingface/hub`.
-
-If you want runtime to load the exact local snapshot directories directly, also write a manifest during prefetch:
-
-```bash
-uv run fattervoice-prefetch \
-  --model all \
-  --cache-dir /path/to/huggingface/hub \
-  --manifest /path/to/prefetched-models.json
-```
+The prefetch helper now relies on the active Hugging Face cache configuration instead of wrapper-specific cache or manifest flags. In the Docker image, that cache path is hardcoded to `/opt/huggingface/hub`.
 
 ## Docker
 

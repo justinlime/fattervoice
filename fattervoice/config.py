@@ -21,11 +21,8 @@ class ServerConfig:
     dtype: str
     default_language: str
     max_text_length: int
-    model_cache_dir: Optional[Path]
-    prefetch_manifest_path: Optional[Path]
     wyoming_enabled: bool
     wyoming_uri: Optional[str]
-    wyoming_audio_chunk_samples: int
     log_level: str
     num_step: int = 16
     guidance_scale: float = 2.0
@@ -219,21 +216,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Estimated duration threshold in seconds above which OmniVoice chunked long-form generation is activated.",
     )
     parser.add_argument(
-        "--model-cache-dir",
-        default=(
-            environment_default("FATTERVOICE_MODEL_CACHE_DIR", "")
-            or environment_default("HF_HUB_CACHE", "")
-            or environment_default("HUGGINGFACE_HUB_CACHE", "")
-            or environment_default("TRANSFORMERS_CACHE", "")
-        ),
-        help="Optional Hugging Face hub cache directory for model artifacts.",
-    )
-    parser.add_argument(
-        "--prefetch-manifest",
-        default=environment_default("FATTERVOICE_PREFETCH_MANIFEST", ""),
-        help="Optional JSON manifest that maps prefetched model IDs to exact local snapshot paths.",
-    )
-    parser.add_argument(
         "--wyoming-enabled",
         action=argparse.BooleanOptionalAction,
         default=environment_flag("FATTERVOICE_WYOMING_ENABLED", True),
@@ -243,12 +225,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--wyoming-uri",
         default=environment_default("FATTERVOICE_WYOMING_URI", "tcp://0.0.0.0:10300"),
         help="Wyoming server URI such as tcp://0.0.0.0:10300 or unix:///tmp/fattervoice.sock.",
-    )
-    parser.add_argument(
-        "--wyoming-audio-chunk-samples",
-        type=int,
-        default=int(environment_default("FATTERVOICE_WYOMING_AUDIO_CHUNK_SAMPLES", "4096")),
-        help="How many mono PCM samples to pack into each Wyoming audio-chunk event.",
     )
     parser.add_argument(
         "--log-level",
@@ -298,16 +274,6 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         parser.error("--audio-chunk-duration must be greater than zero.")
     if args.audio_chunk_threshold <= 0.0:
         parser.error("--audio-chunk-threshold must be greater than zero.")
-    if args.wyoming_audio_chunk_samples <= 0:
-        parser.error("--wyoming-audio-chunk-samples must be a positive integer.")
-
-    model_cache_dir = None
-    if args.model_cache_dir:
-        model_cache_dir = Path(args.model_cache_dir).expanduser().resolve()
-
-    prefetch_manifest_path = None
-    if args.prefetch_manifest:
-        prefetch_manifest_path = Path(args.prefetch_manifest).expanduser().resolve()
 
     wyoming_uri: Optional[str] = args.wyoming_uri
     if args.wyoming_enabled and not wyoming_uri:
@@ -324,11 +290,8 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         dtype=args.dtype,
         default_language=args.default_language,
         max_text_length=args.max_text_length,
-        model_cache_dir=model_cache_dir,
-        prefetch_manifest_path=prefetch_manifest_path,
         wyoming_enabled=args.wyoming_enabled,
         wyoming_uri=wyoming_uri,
-        wyoming_audio_chunk_samples=args.wyoming_audio_chunk_samples,
         log_level=args.log_level.upper(),
         num_step=args.num_step,
         guidance_scale=args.guidance_scale,
