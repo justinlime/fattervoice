@@ -8,7 +8,7 @@ import types
 import unittest
 from pathlib import Path
 
-from fatterqwen.prefetch_manifest import (
+from fattervoice.prefetch_manifest import (
     read_prefetch_manifest,
     resolve_cached_model_snapshot_path,
     resolve_prefetched_model_path,
@@ -39,13 +39,13 @@ class PrefetchManifestTests(unittest.TestCase):
             snapshot_path.mkdir()
 
             write_prefetch_manifest(
-                {"Qwen/Qwen3-TTS-12Hz-1.7B-Base": snapshot_path},
+                {"k2-fsa/OmniVoice": snapshot_path},
                 manifest_path,
             )
 
             self.assertEqual(
                 read_prefetch_manifest(manifest_path),
-                {"Qwen/Qwen3-TTS-12Hz-1.7B-Base": str(snapshot_path.resolve())},
+                {"k2-fsa/OmniVoice": str(snapshot_path.resolve())},
             )
 
     def test_resolve_prefetched_model_path_prefers_existing_local_snapshot(self) -> None:
@@ -67,13 +67,13 @@ class PrefetchManifestTests(unittest.TestCase):
             snapshot_path = Path(temp_dir) / "snapshot"
             snapshot_path.mkdir()
             write_prefetch_manifest(
-                {"Qwen/Qwen3-TTS-12Hz-1.7B-Base": snapshot_path},
+                {"k2-fsa/OmniVoice": snapshot_path},
                 manifest_path,
             )
 
             self.assertEqual(
                 resolve_prefetched_model_path(
-                    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                    "k2-fsa/OmniVoice",
                     manifest_path,
                     None,
                 ),
@@ -108,7 +108,7 @@ class PrefetchManifestTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     resolve_cached_model_snapshot_path(
-                        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                        "k2-fsa/OmniVoice",
                         None,
                     ),
                     str(snapshot_path.resolve()),

@@ -1,0 +1,639 @@
+"""Shared synthesis service used by both the HTTP and Wyoming adapters."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+import numpy as np
+from sentence_stream import SentenceBoundaryDetector
+
+from .audio import audio_to_pcm16_bytes, iter_byte_chunks
+from .config import ServerConfig
+from .hf_cache import configure_huggingface_cache, is_huggingface_offline_mode_enabled
+from .model_catalog import resolve_model_id
+from .prefetch_manifest import resolve_prefetched_model_path
+from .voice_registry import VoiceEntry, VoiceRegistry
+
+LOGGER = logging.getLogger(__name__)
+_STREAMING_PCM_CHUNK_BYTES = 8192
+
+
+@dataclass(frozen=True)
+class CachedVoiceClonePrompt:
+    """Cached OmniVoice prompt object for one validated voice registry entry."""
+
+    voice_id: str
+    prompt: object
+
+
+@dataclass(frozen=True)
+class SynthesisRequest:
+    """Normalized synthesis request shared across protocol adapters."""
+
+    text: str
+    voice_id: str | None = None
+    language: str | None = None
+    speed: float | None = None
+
+
+
+def normalize_omnivoice_language(language: str | None) -> str | None:
+    """Normalize user-supplied language values into OmniVoice-friendly identifiers.
+
+    Usage:
+        The HTTP and Wyoming adapters may receive human-readable names, BCP47
+        tags, or special auto-detection markers. This helper keeps that cleanup
+        logic in one place before values are passed into OmniVoice generation.
+
+    Parameters:
+        language: The raw optional language value supplied by a client or config.
+
+    Returns:
+        `None` when OmniVoice should auto-detect the language, otherwise a
+        cleaned language code or language name string.
+    """
+    if language is None:
+        return None
+
+    normalized_language = language.strip()
+    if not normalized_language:
+        return None
+
+    normalized_key = normalized_language.replace("_", "-").lower()
+    if normalized_key in {"*", "any", "auto", "automatic", "default", "mul"}:
+        return None
+
+    if "-" in normalized_key:
+        primary_subtag = normalized_key.split("-", 1)[0]
+        if primary_subtag:
+            return primary_subtag
+
+    return normalized_language
+
+
+
+def normalize_omnivoice_device_map(device: str) -> str:
+    """Normalize configured device strings into values accepted by OmniVoice.
+
+    Usage:
+        Existing deployments often use the shorthand `cuda`, while OmniVoice
+        examples and Hugging Face device-map handling are more predictable when a
+        concrete CUDA ordinal such as `cuda:0` is used. This helper preserves
+        existing non-CUDA values and upgrades the common shorthand.
+
+    Parameters:
+        device: The raw runtime device string from configuration.
+
+    Returns:
+        A normalized device-map string suitable for `OmniVoice.from_pretrained`.
+    """
+    normalized_device = device.strip()
+    if normalized_device == "cuda":
+        return "cuda:0"
+    return normalized_device
+
+
+
+def coerce_waveform_array(waveform: Any) -> np.ndarray:
+    """Convert an OmniVoice waveform output into a flat float32 NumPy array.
+
+    Usage:
+        OmniVoice is documented to return NumPy arrays, but tests and future
+        library versions may hand back tensor-like objects. This helper gives the
+        service one place to coerce those values into the stable mono array shape
+        expected by the HTTP and Wyoming adapters.
+
+    Parameters:
+        waveform: The first audio item returned by `OmniVoice.generate(...)`.
+
+    Returns:
+        A one-dimensional float32 NumPy waveform ready for PCM/WAV conversion.
+    """
+    if hasattr(waveform, "detach"):
+        waveform = waveform.detach().cpu().numpy()
+    return np.asarray(waveform, dtype=np.float32).flatten()
+
+
+
+def split_text_for_streaming(text: str) -> list[str]:
+    """Split synthesized text into sentence-first streaming segments.
+
+    Usage:
+        OmniVoice currently exposes buffered generation rather than a documented
+        model-incremental audio streaming API. When clients explicitly request a
+        low-latency stream, the wrapper can still reduce time-to-first-audio by
+        synthesizing one sentence-like segment at a time. This helper centralizes
+        that segmentation logic and preserves the final trailing fragment when no
+        closing punctuation is present.
+
+    Parameters:
+        text: The already-validated request text that should be segmented.
+
+    Returns:
+        A non-empty ordered list of stripped text segments suitable for
+        sequential synthesis.
+    """
+    sentence_detector = SentenceBoundaryDetector()
+    streaming_segments = [
+        segment.strip()
+        for segment in sentence_detector.add_chunk(text)
+        if segment.strip()
+    ]
+    trailing_segment = sentence_detector.finish().strip()
+    if trailing_segment:
+        streaming_segments.append(trailing_segment)
+    return streaming_segments or [text.strip()]
+
+
+class TtsService:
+    """Long-lived model wrapper that serializes GPU inference and voice resolution."""
+
+    def __init__(self, config: ServerConfig, voice_registry: VoiceRegistry) -> None:
+        """Initialize the shared synthesis service without loading the model yet.
+
+        Usage:
+            Construct the service once during application startup, then call
+            `await start()` before serving any traffic.
+
+        Parameters:
+            config: Immutable runtime configuration for the server.
+            voice_registry: The validated voice registry shared by all protocols.
+
+        Returns:
+            None. A new `TtsService` instance is initialized in place.
+        """
+        self.config = config
+        self.voice_registry = voice_registry
+        self.model_id = resolve_model_id(config.model)
+        self.device_map = normalize_omnivoice_device_map(config.device)
+        self._model = None
+        self._model_lock = threading.Lock()
+        self._prepared_voice_lock = threading.Lock()
+        self._prepared_voice_cache: dict[str, CachedVoiceClonePrompt] = {}
+
+    def close(self) -> None:
+        """Release cached prompt state owned by the synthesis service.
+
+        Usage:
+            Tests or future shutdown hooks can call this method to drop cached
+            voice-clone prompt objects during teardown.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. Cached prompt objects are cleared in place.
+        """
+        with self._prepared_voice_lock:
+            self._prepared_voice_cache.clear()
+
+    @property
+    def sample_rate(self) -> int:
+        """Return the model sample rate after startup has loaded the model.
+
+        Usage:
+            Protocol adapters use this property to advertise audio metadata and
+            construct WAV headers without duplicating model-specific knowledge.
+
+        Parameters:
+            None.
+
+        Returns:
+            The integer waveform sample rate reported by the loaded model.
+
+        Raises:
+            RuntimeError: If startup has not loaded the model yet.
+        """
+        return int(self._require_model().sampling_rate)
+
+    async def start(self) -> None:
+        """Load the OmniVoice model, prime voice prompts, and optionally warm it up.
+
+        Usage:
+            Call this exactly once during process startup before either server
+            adapter begins accepting requests.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The method completes when the model is ready to serve requests.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._load_model)
+        await loop.run_in_executor(None, self._prime_voice_clone_prompt_cache)
+        if self.config.warmup:
+            await self.warmup()
+
+    async def warmup(self) -> None:
+        """Run a short synthesis request so prompt caches and kernels are warmed up.
+
+        Usage:
+            This method is optional and is only invoked when startup warmup is
+            enabled. It uses the default voice from the validated voice registry.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The method completes when the warmup request finishes.
+        """
+        default_voice = self.voice_registry.get(None)
+        LOGGER.info("Running warmup request using voice %s", default_voice.voice_id)
+        await self.synthesize(
+            SynthesisRequest(
+                text=self.config.warmup_text,
+                voice_id=default_voice.voice_id,
+            )
+        )
+
+    def validate_request(self, request: SynthesisRequest) -> VoiceEntry:
+        """Validate request text and resolve the referenced voice before synthesis.
+
+        Usage:
+            Protocol adapters call this method before opening a streaming response
+            so client-facing validation errors are raised early and consistently.
+
+        Parameters:
+            request: The normalized request that should be validated.
+
+        Returns:
+            The resolved `VoiceEntry` that should be used for synthesis.
+
+        Raises:
+            ValueError: If the request text is empty or exceeds the configured limit.
+            VoiceRegistryError: If the requested voice does not exist.
+        """
+        self._validate_request_text(request.text)
+        return self.voice_registry.get(request.voice_id)
+
+    async def synthesize(self, request: SynthesisRequest) -> tuple[np.ndarray, int]:
+        """Generate a complete waveform for a single synthesis request.
+
+        Usage:
+            Non-streaming HTTP responses, Wyoming non-streaming synthesis, and
+            warmup logic use this method when the entire waveform is needed
+            before returning a response.
+
+        Parameters:
+            request: A normalized request describing the text, voice, and runtime
+                options for the generation.
+
+        Returns:
+            A tuple of `(waveform, sample_rate)` where the waveform is a mono
+            float32 NumPy array.
+        """
+        voice = self.validate_request(request)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self._generate_waveform(request, voice))
+
+    def stream_pcm_chunks(self, request: SynthesisRequest) -> AsyncIterator[bytes]:
+        """Yield PCM chunks for a request after one buffered OmniVoice generation.
+
+        Usage:
+            This method preserves the highest-quality whole-request synthesis path
+            while still exposing chunked WAV/PCM transport. It validates eagerly,
+            runs one full OmniVoice generation in the background, and then chunks
+            the resulting PCM bytes for HTTP or Wyoming delivery.
+
+        Parameters:
+            request: A normalized request describing the text, voice, and runtime
+                options for the generation.
+
+        Returns:
+            An async iterator that yields raw 16-bit PCM audio chunks.
+        """
+        self.validate_request(request)
+
+        async def emit_buffered_pcm_chunks() -> AsyncIterator[bytes]:
+            """Generate one waveform asynchronously and yield it as PCM chunks.
+
+            Usage:
+                The outer method performs eager validation so HTTP/Wyoming can
+                still return normal client errors before any bytes are sent, while
+                this nested generator handles the deferred full-audio generation.
+
+            Parameters:
+                None. It closes over the validated request state.
+
+            Returns:
+                An async iterator that yields fixed-size PCM byte chunks.
+            """
+            waveform, sample_rate = await self.synthesize(request)
+            _ = sample_rate
+            pcm_payload = audio_to_pcm16_bytes(waveform)
+            for pcm_chunk in iter_byte_chunks(pcm_payload, _STREAMING_PCM_CHUNK_BYTES):
+                yield pcm_chunk
+
+        return emit_buffered_pcm_chunks()
+
+    def stream_low_latency_pcm_chunks(self, request: SynthesisRequest) -> AsyncIterator[bytes]:
+        """Yield PCM chunks using sentence-sized sequential synthesis for lower TTFA.
+
+        Usage:
+            OmniVoice does not currently expose a documented true incremental
+            audio streaming API. This method approximates lower-latency streaming
+            for explicit `stream=true` HTTP requests by splitting validated text
+            into sentence-like segments, synthesizing them one at a time with the
+            cached voice-clone prompt, and emitting PCM as each segment finishes.
+            Whole-request buffered synthesis remains available through
+            `stream_pcm_chunks(...)` for quality-first paths.
+
+        Parameters:
+            request: A normalized request describing the text, voice, and runtime
+                options for the generation.
+
+        Returns:
+            An async iterator that yields raw 16-bit PCM audio chunks as each
+            sentence-sized synthesis segment completes.
+        """
+        resolved_voice = self.validate_request(request)
+        streaming_segments = split_text_for_streaming(request.text)
+
+        async def emit_low_latency_pcm_chunks() -> AsyncIterator[bytes]:
+            """Generate sentence-sized waveform segments and yield them as PCM chunks.
+
+            Usage:
+                The outer method performs eager validation and segment planning so
+                the nested generator can focus on sequential segment synthesis and
+                byte emission once the HTTP response body has started.
+
+            Parameters:
+                None. It closes over the validated request and resolved voice.
+
+            Returns:
+                An async iterator that yields fixed-size PCM byte chunks from each
+                synthesized text segment in order.
+            """
+            loop = asyncio.get_running_loop()
+            for segment_text in streaming_segments:
+                segment_request = SynthesisRequest(
+                    text=segment_text,
+                    voice_id=resolved_voice.voice_id,
+                    language=request.language,
+                    speed=request.speed,
+                )
+                waveform, sample_rate = await loop.run_in_executor(
+                    None,
+                    lambda: self._generate_waveform(segment_request, resolved_voice),
+                )
+                _ = sample_rate
+                pcm_payload = audio_to_pcm16_bytes(waveform)
+                for pcm_chunk in iter_byte_chunks(pcm_payload, _STREAMING_PCM_CHUNK_BYTES):
+                    yield pcm_chunk
+
+        return emit_low_latency_pcm_chunks()
+
+    def _load_model(self) -> None:
+        """Load the OmniVoice model using the configured device and dtype.
+
+        Usage:
+            Startup calls this method through `start()`. Repeated calls are cheap
+            because the method exits immediately once the model is already loaded.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The loaded model is stored on the service instance.
+        """
+        if self._model is not None:
+            return
+
+        configure_huggingface_cache(self.config.model_cache_dir)
+
+        import torch
+        from omnivoice import OmniVoice
+
+        try:
+            dtype = getattr(torch, self.config.dtype)
+        except AttributeError as exc:
+            raise ValueError(
+                f"Unsupported torch dtype {self.config.dtype!r}."
+            ) from exc
+
+        model_source = resolve_prefetched_model_path(
+            self.model_id,
+            self.config.prefetch_manifest_path,
+            self.config.model_cache_dir,
+        )
+        resolved_model_path = Path(model_source).expanduser()
+        if (
+            self.config.prefetch_manifest_path is not None
+            and model_source == self.model_id
+        ):
+            LOGGER.warning(
+                "Prefetch manifest %s did not resolve a local snapshot path for %s; falling back to Hugging Face cache inspection / model ID loading.",
+                self.config.prefetch_manifest_path,
+                self.model_id,
+            )
+
+        if is_huggingface_offline_mode_enabled() and not resolved_model_path.exists():
+            build_model_selection_hint = os.environ.get("MODEL_SELECTION_HINT", "").strip()
+            if build_model_selection_hint and build_model_selection_hint.lower() != "all":
+                try:
+                    built_model_id_hint = resolve_model_id(build_model_selection_hint)
+                except ValueError:
+                    built_model_id_hint = build_model_selection_hint
+                if built_model_id_hint != self.model_id:
+                    raise FileNotFoundError(
+                        "Offline mode is enabled, but this container image was built without the requested OmniVoice model. "
+                        f"The image build hint is {build_model_selection_hint!r}, while runtime requested {self.config.model!r} "
+                        f"({self.model_id}). Rebuild the image with --build-arg MODEL_SELECTION=all or --build-arg MODEL_SELECTION={self.config.model}, "
+                        "or run an image that already contains the requested snapshot."
+                    )
+            raise FileNotFoundError(
+                "Offline mode is enabled, but no local snapshot path could be resolved for "
+                f"{self.model_id!r}. Check FATTERVOICE_PREFETCH_MANIFEST and the Hugging Face hub cache contents."
+            )
+
+        LOGGER.info(
+            "Loading OmniVoice model %s from %s on device %s with dtype %s",
+            self.config.model,
+            model_source,
+            self.device_map,
+            self.config.dtype,
+        )
+        self._model = OmniVoice.from_pretrained(
+            model_source,
+            device_map=self.device_map,
+            dtype=dtype,
+            load_asr=False,
+        )
+        LOGGER.info("Model ready with sample rate %s Hz", self._model.sampling_rate)
+
+    def _require_model(self):
+        """Return the loaded OmniVoice model instance or fail with a clear error.
+
+        Usage:
+            Internal helper methods call this before attempting prompt creation or
+            generation so the error surface stays consistent if startup ordering is
+            incorrect.
+
+        Parameters:
+            None.
+
+        Returns:
+            The loaded `OmniVoice` model instance.
+
+        Raises:
+            RuntimeError: If the model has not been loaded yet.
+        """
+        if self._model is None:
+            raise RuntimeError("The TTS model has not been loaded yet.")
+        return self._model
+
+    def _prime_voice_clone_prompt_cache(self) -> None:
+        """Create cached OmniVoice voice-clone prompts for every configured voice.
+
+        Usage:
+            Startup calls this helper once after model load so the first request
+            for each voice does not pay the prompt-tokenization cost. This also
+            fails fast if any voice/transcript pair cannot be converted into an
+            OmniVoice prompt.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. Prompt objects are cached on the service instance.
+        """
+        voice_entries = self.voice_registry.values()
+        LOGGER.info("Priming OmniVoice prompt cache for %d voices", len(voice_entries))
+        for voice in voice_entries:
+            self._resolve_cached_voice_clone_prompt(voice)
+
+    def _resolve_cached_voice_clone_prompt(
+        self,
+        voice: VoiceEntry,
+    ) -> CachedVoiceClonePrompt:
+        """Create or retrieve the cached OmniVoice prompt for one validated voice.
+
+        Usage:
+            Buffered and streaming synthesis both call this helper so every
+            request reuses the same tokenized voice-clone prompt instead of
+            re-processing the original reference audio files.
+
+        Parameters:
+            voice: The validated voice entry selected for the current request.
+
+        Returns:
+            A cached `CachedVoiceClonePrompt` object ready for OmniVoice
+            generation calls.
+        """
+        with self._prepared_voice_lock:
+            cached_voice = self._prepared_voice_cache.get(voice.voice_id)
+            if cached_voice is not None:
+                return cached_voice
+
+            with self._model_lock:
+                prompt = self._require_model().create_voice_clone_prompt(
+                    ref_audio=str(voice.audio_path),
+                    ref_text=voice.transcript,
+                    preprocess_prompt=self.config.preprocess_voice_clone_prompt,
+                )
+
+            cached_voice = CachedVoiceClonePrompt(voice_id=voice.voice_id, prompt=prompt)
+            self._prepared_voice_cache[voice.voice_id] = cached_voice
+            return cached_voice
+
+    def _validate_request_text(self, text: str) -> None:
+        """Validate request text before it reaches the heavy model inference path.
+
+        Usage:
+            Both streaming and non-streaming synthesis call this helper to reject
+            empty or excessively long requests consistently across protocols.
+
+        Parameters:
+            text: The request text that will be synthesized.
+
+        Returns:
+            None. The function succeeds silently when the text is acceptable.
+
+        Raises:
+            ValueError: If the text is empty or longer than the configured limit.
+        """
+        normalized_text = text.strip()
+        if not normalized_text:
+            raise ValueError("Synthesis text cannot be empty.")
+        if len(normalized_text) > self.config.max_text_length:
+            raise ValueError(
+                "Synthesis text exceeds the configured maximum length of "
+                f"{self.config.max_text_length} characters."
+            )
+
+    def _generate_waveform(
+        self,
+        request: SynthesisRequest,
+        voice: VoiceEntry,
+    ) -> tuple[np.ndarray, int]:
+        """Generate one full OmniVoice waveform for a validated synthesis request.
+
+        Usage:
+            This helper centralizes the per-call interaction with OmniVoice so
+            the HTTP adapter, Wyoming adapter, and warmup flow all share the same
+            prompt caching and generation-parameter logic.
+
+        Parameters:
+            request: The normalized request supplying text, language, and speed.
+            voice: The validated voice entry selected for the request.
+
+        Returns:
+            A tuple of `(waveform, sample_rate)` where the waveform is ready for
+            WAV/PCM encoding.
+        """
+        cached_voice = self._resolve_cached_voice_clone_prompt(voice)
+        generation_kwargs = self._build_generation_kwargs(request, cached_voice)
+        with self._model_lock:
+            audio_list = self._require_model().generate(**generation_kwargs)
+
+        waveform = audio_list[0] if audio_list else np.zeros(0, dtype=np.float32)
+        return coerce_waveform_array(waveform), self.sample_rate
+
+    def _build_generation_kwargs(
+        self,
+        request: SynthesisRequest,
+        cached_voice: CachedVoiceClonePrompt,
+    ) -> dict[str, object]:
+        """Build the OmniVoice keyword arguments for one synthesis call.
+
+        Usage:
+            Internal generation methods call this helper so every request uses
+            the same cached voice-clone prompt and the same server-level OmniVoice
+            tuning defaults unless a client overrides request-level speed.
+
+        Parameters:
+            request: The normalized request supplying text, language, and speed.
+            cached_voice: The tokenized OmniVoice voice-clone prompt selected for
+                this request.
+
+        Returns:
+            A dictionary of keyword arguments accepted by `OmniVoice.generate`.
+        """
+        generation_language = normalize_omnivoice_language(
+            request.language or self.config.default_language
+        )
+        generation_kwargs: dict[str, object] = {
+            "text": request.text.strip(),
+            "language": generation_language,
+            "voice_clone_prompt": cached_voice.prompt,
+            "num_step": self.config.num_step,
+            "guidance_scale": self.config.guidance_scale,
+            "denoise": self.config.denoise,
+            "t_shift": self.config.t_shift,
+            "position_temperature": self.config.position_temperature,
+            "class_temperature": self.config.class_temperature,
+            "layer_penalty_factor": self.config.layer_penalty_factor,
+            "postprocess_output": self.config.postprocess_output_audio,
+            "audio_chunk_duration": self.config.audio_chunk_duration,
+            "audio_chunk_threshold": self.config.audio_chunk_threshold,
+        }
+        if request.speed is not None:
+            generation_kwargs["speed"] = request.speed
+        return generation_kwargs

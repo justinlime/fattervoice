@@ -9,14 +9,14 @@ import wave
 from pathlib import Path
 from types import SimpleNamespace
 
-from fatterqwen.voice_registry import VoiceRegistry
+from fattervoice.voice_registry import VoiceRegistry
 
 try:
     from wyoming.info import Describe
     from wyoming.tts import SynthesizeChunk, SynthesizeStart, SynthesizeStop, SynthesizeVoice
 
-    from fatterqwen.wyoming_server import (
-        FatterQwenWyomingHandler,
+    from fattervoice.wyoming_server import (
+        FatterVoiceWyomingHandler,
         advertised_wyoming_languages,
         build_wyoming_info,
     )
@@ -68,7 +68,7 @@ if WYOMING_IMPORT_ERROR is None:
                 yield pcm_chunk
 
 
-    class RecordingWyomingHandler(FatterQwenWyomingHandler):
+    class RecordingWyomingHandler(FatterVoiceWyomingHandler):
         """Wyoming handler test double that records outgoing events in memory.
 
         Usage:
@@ -76,7 +76,7 @@ if WYOMING_IMPORT_ERROR is None:
             types emitted for discovery and streaming flows without opening sockets.
 
         Parameters:
-            The parameters are identical to `FatterQwenWyomingHandler`.
+            The parameters are identical to `FatterVoiceWyomingHandler`.
 
         Returns:
             None. The handler stores emitted events on `recorded_events`.
@@ -209,12 +209,12 @@ if WYOMING_IMPORT_ERROR is None:
             self.assertIsNone(fake_service.requests[0].language)
 
         async def test_build_synthesis_request_maps_home_assistant_language_tags(self) -> None:
-            """Ensure Home Assistant language tags are translated for the upstream model.
+            """Ensure Home Assistant language tags are translated for OmniVoice.
 
             Usage:
                 Wyoming/HA language selection uses BCP47-like tags such as `en-US`,
-                but `faster-qwen3-tts` expects names like `English`. This test
-                verifies the adapter performs that translation before inference.
+                while OmniVoice prefers compact language IDs such as `en`. This
+                test verifies the adapter performs that translation before inference.
 
             Parameters:
                 None.
@@ -230,7 +230,7 @@ if WYOMING_IMPORT_ERROR is None:
             )
 
             self.assertEqual(synthesis_request.voice_id, "hank")
-            self.assertEqual(synthesis_request.language, "English")
+            self.assertEqual(synthesis_request.language, "en")
 
         async def test_build_synthesis_request_handles_language_only_voice_payloads(self) -> None:
             """Ensure language-only Wyoming voice payloads still resolve to a model language.
@@ -246,7 +246,7 @@ if WYOMING_IMPORT_ERROR is None:
 
             Returns:
                 None. The test asserts that the resulting request has no voice ID and
-                uses the expected upstream model language name.
+                uses the expected OmniVoice language ID.
             """
             handler = self._create_handler()
 
@@ -256,7 +256,7 @@ if WYOMING_IMPORT_ERROR is None:
             )
 
             self.assertIsNone(synthesis_request.voice_id)
-            self.assertEqual(synthesis_request.language, "French")
+            self.assertEqual(synthesis_request.language, "fr")
 
         async def test_build_wyoming_info_uses_home_assistant_compatible_languages(self) -> None:
             """Ensure advertised Wyoming voices use explicit HA-compatible language tags.

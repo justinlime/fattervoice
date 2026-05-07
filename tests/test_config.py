@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fatterqwen.config import parse_server_config
+from fattervoice.config import parse_server_config
 
 
 class ServerConfigTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class ServerConfigTests(unittest.TestCase):
 
         Usage:
             The Docker image sets standard Hugging Face cache environment variables
-            even when `FATTERQWEN_MODEL_CACHE_DIR` is not explicitly provided.
+            even when `FATTERVOICE_MODEL_CACHE_DIR` is not explicitly provided.
             This test verifies that runtime config parsing still resolves the same
             cache directory so offline startup can inspect the prefetched cache.
 
@@ -38,7 +38,7 @@ class ServerConfigTests(unittest.TestCase):
                 os.environ,
                 {
                     "HF_HUB_CACHE": str(cache_dir),
-                    "FATTERQWEN_MODEL_CACHE_DIR": "",
+                    "FATTERVOICE_MODEL_CACHE_DIR": "",
                     "HUGGINGFACE_HUB_CACHE": "",
                     "TRANSFORMERS_CACHE": "",
                 },
@@ -51,20 +51,20 @@ class ServerConfigTests(unittest.TestCase):
 
             self.assertEqual(server_config.model_cache_dir, cache_dir.resolve())
 
-    def test_parse_server_config_supports_quality_pipeline_flags(self) -> None:
-        """Ensure the new voice-quality options can be configured through the CLI.
+    def test_parse_server_config_supports_omnivoice_generation_flags(self) -> None:
+        """Ensure the OmniVoice runtime knobs can be configured through the CLI.
 
         Usage:
-            The quality pipeline introduced for reference preprocessing and
-            long-form chunking adds several new runtime knobs. This test verifies
-            that representative CLI flags land in the parsed server config.
+            The backend migration adds OmniVoice-specific decoding and prompt
+            preparation options. This test verifies that representative CLI flags
+            land in the parsed server config.
 
         Parameters:
             None.
 
         Returns:
             None. The test asserts that the parsed config contains the requested
-            quality-pipeline settings.
+            OmniVoice settings.
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             voices_dir = Path(temp_dir) / "voices"
@@ -73,32 +73,35 @@ class ServerConfigTests(unittest.TestCase):
             server_config = parse_server_config([
                 "--voices-dir",
                 str(voices_dir),
-                "--no-preprocess-reference-audio",
-                "--no-normalize-reference-transcript",
-                "--reference-prompt-target-rms",
+                "--num-step",
+                "24",
+                "--guidance-scale",
+                "2.5",
+                "--no-denoise",
+                "--position-temperature",
+                "4.0",
+                "--class-temperature",
                 "0.2",
+                "--layer-penalty-factor",
+                "6.0",
+                "--no-preprocess-voice-clone-prompt",
                 "--no-postprocess-output-audio",
-                "--longform-chunk-threshold-units",
-                "500",
-                "--longform-target-units",
-                "300",
-                "--longform-min-units",
-                "90",
-                "--longform-crossfade-milliseconds",
-                "40",
-                "--longform-gap-milliseconds",
-                "70",
+                "--audio-chunk-duration",
+                "12.0",
+                "--audio-chunk-threshold",
+                "24.0",
             ])
 
-        self.assertFalse(server_config.preprocess_reference_audio)
-        self.assertFalse(server_config.normalize_reference_transcript)
-        self.assertEqual(server_config.reference_prompt_target_rms, 0.2)
+        self.assertEqual(server_config.num_step, 24)
+        self.assertEqual(server_config.guidance_scale, 2.5)
+        self.assertFalse(server_config.denoise)
+        self.assertEqual(server_config.position_temperature, 4.0)
+        self.assertEqual(server_config.class_temperature, 0.2)
+        self.assertEqual(server_config.layer_penalty_factor, 6.0)
+        self.assertFalse(server_config.preprocess_voice_clone_prompt)
         self.assertFalse(server_config.postprocess_output_audio)
-        self.assertEqual(server_config.longform_chunk_threshold_units, 500)
-        self.assertEqual(server_config.longform_target_units, 300)
-        self.assertEqual(server_config.longform_min_units, 90)
-        self.assertEqual(server_config.longform_crossfade_milliseconds, 40)
-        self.assertEqual(server_config.longform_gap_milliseconds, 70)
+        self.assertEqual(server_config.audio_chunk_duration, 12.0)
+        self.assertEqual(server_config.audio_chunk_threshold, 24.0)
 
 
 if __name__ == "__main__":

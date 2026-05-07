@@ -6,18 +6,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fatterqwen.model_catalog import expand_model_selection, resolve_model_id
+from fattervoice.model_catalog import (
+    expand_model_selection,
+    expand_prefetch_asset_ids,
+    resolve_model_id,
+)
 
 
 class ModelCatalogTests(unittest.TestCase):
-    """Verify that built-in model aliases resolve to the expected upstream IDs."""
+    """Verify that built-in OmniVoice aliases resolve to the expected model IDs."""
 
     def test_resolve_known_alias(self) -> None:
-        """Ensure the required short alias resolves to the canonical Hugging Face model ID.
+        """Ensure the built-in OmniVoice alias resolves to the canonical model ID.
 
         Usage:
-            This test guards the project contract that `1.7B` must remain a valid
-            shorthand model selector.
+            This test guards the project contract that `omnivoice` remains a
+            valid shorthand model selector.
 
         Parameters:
             None.
@@ -26,8 +30,8 @@ class ModelCatalogTests(unittest.TestCase):
             None. The test asserts on the resolved model identifier.
         """
         self.assertEqual(
-            resolve_model_id("1.7B"),
-            "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+            resolve_model_id("omnivoice"),
+            "k2-fsa/OmniVoice",
         )
 
     def test_resolve_local_path(self) -> None:
@@ -48,22 +52,38 @@ class ModelCatalogTests(unittest.TestCase):
             self.assertEqual(resolve_model_id(str(model_path)), str(model_path))
 
     def test_expand_all_models(self) -> None:
-        """Ensure the prefetch helper expands `all` into both supported built-in models.
+        """Ensure the prefetch helper expands `all` into the supported built-in model.
 
         Usage:
-            This test protects Docker/offline workflows that warm both supported
-            voice-clone models into the cache ahead of time.
+            This test protects Docker/offline workflows that warm the built-in
+            OmniVoice model into the cache ahead of time.
 
         Parameters:
             None.
 
         Returns:
-            None. The test asserts the expected model list length and contents.
+            None. The test asserts the expected model list contents.
         """
         expanded_models = expand_model_selection("all")
-        self.assertEqual(len(expanded_models), 2)
-        self.assertIn("Qwen/Qwen3-TTS-12Hz-0.6B-Base", expanded_models)
-        self.assertIn("Qwen/Qwen3-TTS-12Hz-1.7B-Base", expanded_models)
+        self.assertEqual(expanded_models, ["k2-fsa/OmniVoice"])
+
+    def test_expand_prefetch_assets_includes_audio_tokenizer_dependency(self) -> None:
+        """Ensure OmniVoice prefetch also downloads the required audio tokenizer repo.
+
+        Usage:
+            Offline OmniVoice loading may need the auxiliary Higgs audio tokenizer
+            repository, so this test verifies the prefetch planner includes it.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts the expected ordered prefetch target list.
+        """
+        self.assertEqual(
+            expand_prefetch_asset_ids("omnivoice"),
+            ["k2-fsa/OmniVoice", "eustlb/higgs-audio-v2-tokenizer"],
+        )
 
 
 if __name__ == "__main__":

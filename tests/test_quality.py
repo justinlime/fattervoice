@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from fatterqwen.quality import (
+from fattervoice.quality import (
     clean_generated_audio,
     compact_silences,
     compute_audio_rms,

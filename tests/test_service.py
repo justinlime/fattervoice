@@ -1,4 +1,4 @@
-"""Unit tests for service-layer model loading compatibility helpers."""
+"""Unit tests for the shared OmniVoice-backed synthesis service."""
 
 from __future__ import annotations
 
@@ -6,214 +6,319 @@ import asyncio
 import os
 import sys
 import tempfile
-import threading
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 
-from fatterqwen.config import ServerConfig
-from fatterqwen.quality import PreparedVoiceConditioning
-from fatterqwen.service import SynthesisRequest, TtsService, build_supported_model_load_kwargs
-from fatterqwen.voice_registry import VoiceEntry
+from fattervoice.config import ServerConfig
+from fattervoice.service import SynthesisRequest, TtsService
+from fattervoice.voice_registry import VoiceEntry
 
 
-class ModelLoadCompatibilityTests(unittest.TestCase):
-    """Verify service-layer compatibility with restored faster-qwen3-tts loaders."""
+class FakeVoiceRegistry:
+    """Minimal validated voice registry double used by service-layer unit tests."""
 
-    def test_build_supported_model_load_kwargs_includes_local_files_only_when_supported(self) -> None:
-        """Ensure the helper forwards local-only hints when the loader supports them.
+    def __init__(self, entries: list[VoiceEntry]) -> None:
+        """Store deterministic voice entries for later service lookups.
 
         Usage:
-            This test guards compatibility with loader implementations that accept
-            Hugging Face-style `local_files_only` keyword arguments.
+            Service tests build this registry instead of scanning a real voices
+            directory so they can control the exact voice returned for each case.
+
+        Parameters:
+            entries: The voice entries that should appear in the registry.
+
+        Returns:
+            None. The registry state is stored on the instance.
+        """
+        self._entries = {entry.voice_id: entry for entry in entries}
+        self.default_voice_id = entries[0].voice_id
+
+    def get(self, voice_id: str | None) -> VoiceEntry:
+        """Resolve a voice identifier using the same defaulting behavior as production.
+
+        Usage:
+            The `TtsService` calls this method during request validation, so the
+            fake registry mirrors the production API surface closely.
+
+        Parameters:
+            voice_id: The requested public voice identifier, or `None` for the default.
+
+        Returns:
+            The matching `VoiceEntry` object.
+        """
+        return self._entries[voice_id or self.default_voice_id]
+
+    def list_voice_ids(self) -> list[str]:
+        """Return the stable sorted list of available voice IDs.
+
+        Usage:
+            The service and adapter layers call this during metadata and error
+            construction, so the fake registry exposes the same shape.
 
         Parameters:
             None.
 
         Returns:
-            None. The test asserts that all supported keyword arguments are kept.
+            A sorted list of voice identifiers.
         """
+        return sorted(self._entries)
 
-        def loader(
-            model_name: str,
-            *,
-            device: str = "cuda",
-            dtype: object = None,
-            local_files_only: bool = False,
-        ) -> object:
-            return {
-                "model_name": model_name,
-                "device": device,
-                "dtype": dtype,
-                "local_files_only": local_files_only,
-            }
-
-        load_kwargs = build_supported_model_load_kwargs(
-            loader,
-            device="cuda:0",
-            dtype="bf16",
-            local_files_only=True,
-        )
-
-        self.assertEqual(
-            load_kwargs,
-            {
-                "device": "cuda:0",
-                "dtype": "bf16",
-                "local_files_only": True,
-            },
-        )
-
-    def test_build_supported_model_load_kwargs_omits_local_files_only_when_unsupported(self) -> None:
-        """Ensure the helper omits unsupported kwargs for restored upstream loaders.
+    def values(self) -> list[VoiceEntry]:
+        """Return every configured voice entry in stable voice-ID order.
 
         Usage:
-            This test protects against the regression where `fatterqwen` passed
-            `local_files_only` to a restored `faster-qwen3-tts` loader whose
-            `from_pretrained(...)` signature does not accept that keyword.
+            Startup prompt priming iterates over this method in production, so
+            tests use it to mirror that behavior.
 
         Parameters:
             None.
 
         Returns:
-            None. The test asserts that only universally supported kwargs remain.
+            A list of `VoiceEntry` objects.
         """
+        return [self._entries[voice_id] for voice_id in self.list_voice_ids()]
 
-        def loader(model_name: str, *, device: str = "cuda", dtype: object = None) -> object:
-            return {
-                "model_name": model_name,
-                "device": device,
-                "dtype": dtype,
-            }
 
-        load_kwargs = build_supported_model_load_kwargs(
-            loader,
-            device="cuda:0",
-            dtype="bf16",
-            local_files_only=True,
-        )
+class FakeOmniVoiceModel:
+    """Small fake OmniVoice model used to exercise service orchestration paths."""
 
-        self.assertEqual(
-            load_kwargs,
-            {
-                "device": "cuda:0",
-                "dtype": "bf16",
-            },
-        )
+    sampling_rate = 24000
 
-    def test_load_model_uses_compatible_kwargs_with_restored_upstream_signature(self) -> None:
-        """Ensure `_load_model()` succeeds when upstream lacks local_files_only support.
+    def __init__(self) -> None:
+        """Initialize counters that capture how the service calls the fake model.
 
         Usage:
-            This test patches in a lightweight fake `faster_qwen3_tts` module so
+            Each test creates a fresh fake model so prompt-creation and generation
+            call histories start from a clean state.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. Call tracking state is stored on the instance.
+        """
+        self.created_prompts: list[dict[str, object]] = []
+        self.generated_requests: list[dict[str, object]] = []
+
+    def create_voice_clone_prompt(
+        self,
+        *,
+        ref_audio: str,
+        ref_text: str,
+        preprocess_prompt: bool,
+    ) -> object:
+        """Record prompt-creation inputs and return a reusable opaque prompt object.
+
+        Usage:
+            The service caches the returned object, so tests can later assert that
+            repeated syntheses do not rebuild the prompt unnecessarily.
+
+        Parameters:
+            ref_audio: The reference audio path forwarded by the service.
+            ref_text: The transcript paired with the reference audio.
+            preprocess_prompt: Whether OmniVoice prompt preprocessing was enabled.
+
+        Returns:
+            A simple dictionary that acts as a stable fake prompt object.
+        """
+        prompt = {
+            "ref_audio": ref_audio,
+            "ref_text": ref_text,
+            "preprocess_prompt": preprocess_prompt,
+        }
+        self.created_prompts.append(prompt)
+        return prompt
+
+    def generate(self, **kwargs) -> list[np.ndarray]:
+        """Record generation kwargs and return one deterministic waveform.
+
+        Usage:
+            Service tests inspect the captured kwargs to verify language, speed,
+            and cached prompt handling without importing the real OmniVoice stack.
+
+        Parameters:
+            **kwargs: The OmniVoice generation kwargs forwarded by the service.
+
+        Returns:
+            A one-item list containing a mono float32 waveform.
+        """
+        self.generated_requests.append(kwargs)
+        return [np.full(480, 0.25, dtype=np.float32)]
+
+
+
+def build_test_config(temp_dir: str, **overrides: object) -> ServerConfig:
+    """Build a `ServerConfig` instance tailored for service-layer unit tests.
+
+    Usage:
+        Individual tests use this helper to start from one stable default config
+        and override only the specific fields relevant to the current assertion.
+
+    Parameters:
+        temp_dir: Temporary directory root used for filesystem-backed config paths.
+        **overrides: Any `ServerConfig` field overrides needed by the caller.
+
+    Returns:
+        A fully populated `ServerConfig` instance.
+    """
+    config_values: dict[str, object] = {
+        "voices_dir": Path(temp_dir) / "voices",
+        "host": "0.0.0.0",
+        "port": 8000,
+        "model": "omnivoice",
+        "device": "cuda:0",
+        "dtype": "float16",
+        "default_language": "auto",
+        "max_text_length": 4000,
+        "model_cache_dir": None,
+        "prefetch_manifest_path": None,
+        "warmup": False,
+        "warmup_text": "Hello from fattervoice.",
+        "wyoming_enabled": True,
+        "wyoming_uri": "tcp://0.0.0.0:10300",
+        "wyoming_audio_chunk_samples": 4096,
+        "log_level": "INFO",
+        "num_step": 16,
+        "guidance_scale": 2.0,
+        "denoise": True,
+        "t_shift": 0.1,
+        "position_temperature": 5.0,
+        "class_temperature": 0.0,
+        "layer_penalty_factor": 5.0,
+        "preprocess_voice_clone_prompt": True,
+        "postprocess_output_audio": True,
+        "audio_chunk_duration": 15.0,
+        "audio_chunk_threshold": 30.0,
+    }
+    config_values.update(overrides)
+    return ServerConfig(**config_values)
+
+
+
+def build_test_voice_entry(temp_dir: str) -> VoiceEntry:
+    """Create one deterministic `VoiceEntry` for service-layer unit tests.
+
+    Usage:
+        Tests that do not need the full production scanner still need a realistic
+        voice entry containing public IDs, audio paths, and transcripts.
+
+    Parameters:
+        temp_dir: Temporary directory root used to construct stable fake paths.
+
+    Returns:
+        A `VoiceEntry` object that points at a synthetic voice pair.
+    """
+    return VoiceEntry(
+        voice_id="demo",
+        audio_path=Path(temp_dir) / "voices" / "demo.wav",
+        transcript_path=Path(temp_dir) / "voices" / "demo.txt",
+        transcript="This is the demo reference transcript.",
+    )
+
+
+class TtsServiceTests(unittest.TestCase):
+    """Verify prompt caching, model loading, and request translation in `TtsService`."""
+
+    def test_load_model_uses_omnivoice_loader_and_disables_asr(self) -> None:
+        """Ensure `_load_model()` forwards the expected OmniVoice load arguments.
+
+        Usage:
+            This test patches lightweight fake `torch` and `omnivoice` modules so
             the service can exercise its real model-loading path without importing
-            CUDA or the actual upstream package.
+            CUDA or the published OmniVoice package.
 
         Parameters:
             None.
 
         Returns:
-            None. The test asserts that `_load_model()` forwards only supported
-            kwargs and stores the returned model instance.
+            None. The test asserts on the captured OmniVoice loader inputs.
         """
         captured_call: dict[str, object] = {}
 
         class FakeLoadedModel:
-            """Minimal loaded-model stand-in used by the compatibility test."""
+            """Minimal loaded-model stand-in used by the model-loading test."""
 
-            sample_rate = 24000
+            sampling_rate = 24000
 
-        class FakeFasterQwen3TTS:
-            """Stub upstream loader whose signature intentionally lacks local_files_only."""
+        class FakeOmniVoice:
+            """Stub OmniVoice loader that records the arguments it receives."""
 
             @classmethod
             def from_pretrained(
                 cls,
                 model_name: str,
                 *,
-                device: str = "cuda",
-                dtype: object = None,
+                device_map: str,
+                dtype: object,
+                load_asr: bool,
             ) -> FakeLoadedModel:
-                """Record loader inputs and return a tiny fake model instance.
+                """Record OmniVoice loader inputs and return a tiny fake model.
 
                 Usage:
-                    The compatibility test calls this through `TtsService._load_model()`
-                    to verify that unsupported kwargs are not forwarded.
+                    The service test calls this through `TtsService._load_model()`
+                    to verify the wrapper forwards the expected OmniVoice-specific
+                    keyword arguments.
 
                 Parameters:
-                    model_name: The resolved local model path or model ID.
-                    device: The configured runtime device string.
+                    model_name: The resolved local model path or Hugging Face model ID.
+                    device_map: The runtime device map selected by the service.
                     dtype: The resolved torch dtype object.
+                    load_asr: Whether ASR auto-transcription was requested.
 
                 Returns:
-                    A fake loaded model exposing only the attributes needed by the test.
+                    A fake loaded model exposing the sample-rate attribute needed
+                    by the production service.
                 """
                 captured_call["model_name"] = model_name
-                captured_call["device"] = device
+                captured_call["device_map"] = device_map
                 captured_call["dtype"] = dtype
+                captured_call["load_asr"] = load_asr
                 return FakeLoadedModel()
 
-        fake_torch_module = types.SimpleNamespace(bfloat16="fake-bfloat16")
-        fake_loader_module = types.SimpleNamespace(FasterQwen3TTS=FakeFasterQwen3TTS)
+        fake_torch_module = types.SimpleNamespace(float16="fake-float16")
+        fake_omnivoice_module = types.SimpleNamespace(OmniVoice=FakeOmniVoice)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             local_model_path = Path(temp_dir) / "resolved-model"
             local_model_path.mkdir()
-            config = ServerConfig(
-                voices_dir=Path(temp_dir) / "voices",
-                host="0.0.0.0",
-                port=8000,
-                model="1.7B",
-                device="cuda",
-                dtype="bfloat16",
-                default_language="Auto",
-                chunk_size=8,
-                append_silence=True,
-                non_streaming_mode=False,
-                max_text_length=4000,
-                model_cache_dir=None,
-                prefetch_manifest_path=None,
-                warmup=False,
-                warmup_text="Hello from fatterqwen.",
-                wyoming_enabled=True,
-                wyoming_uri="tcp://0.0.0.0:10300",
-                wyoming_audio_chunk_samples=4096,
-                log_level="INFO",
+            config = build_test_config(temp_dir)
+            service = TtsService(
+                config=config,
+                voice_registry=FakeVoiceRegistry([build_test_voice_entry(temp_dir)]),
             )
-            service = TtsService(config, Mock())
 
             with (
-                patch("fatterqwen.service.configure_huggingface_cache", return_value=None),
-                patch("fatterqwen.service.resolve_prefetched_model_path", return_value=str(local_model_path)),
-                patch("fatterqwen.service.is_huggingface_offline_mode_enabled", return_value=False),
+                patch("fattervoice.service.configure_huggingface_cache", return_value=None),
+                patch("fattervoice.service.resolve_prefetched_model_path", return_value=str(local_model_path)),
+                patch("fattervoice.service.is_huggingface_offline_mode_enabled", return_value=False),
                 patch.dict(
                     sys.modules,
                     {
                         "torch": fake_torch_module,
-                        "faster_qwen3_tts": fake_loader_module,
+                        "omnivoice": fake_omnivoice_module,
                     },
                 ),
             ):
                 service._load_model()
 
-            self.assertIsNotNone(service._model)
-            self.assertEqual(captured_call["model_name"], str(local_model_path))
-            self.assertEqual(captured_call["device"], "cuda")
-            self.assertEqual(captured_call["dtype"], "fake-bfloat16")
-            self.assertNotIn("local_files_only", captured_call)
-            service.close()
+        self.assertIsNotNone(service._model)
+        self.assertEqual(captured_call["model_name"], str(local_model_path))
+        self.assertEqual(captured_call["device_map"], "cuda:0")
+        self.assertEqual(captured_call["dtype"], "fake-float16")
+        self.assertFalse(captured_call["load_asr"])
 
     def test_load_model_explains_single_model_offline_image_mismatch(self) -> None:
         """Ensure offline startup explains when runtime requests a non-prefetched model.
 
         Usage:
-            Operators may build a lean image with one prefetched model and later
-            override `FATTERQWEN_MODEL` at runtime. This test verifies that the
-            resulting offline error clearly points to the build/runtime mismatch
-            instead of only reporting a generic cache miss.
+            Operators may build a lean image with the built-in OmniVoice snapshot
+            and later override `FATTERVOICE_MODEL` at runtime to another Hugging
+            Face repo. This test verifies that the resulting offline error clearly
+            points to the build/runtime mismatch instead of only reporting a cache miss.
 
         Parameters:
             None.
@@ -222,597 +327,174 @@ class ModelLoadCompatibilityTests(unittest.TestCase):
             None. The test asserts that the raised error mentions both the build
             hint and the requested runtime model.
         """
-        fake_torch_module = types.SimpleNamespace(bfloat16="fake-bfloat16")
-        fake_loader_module = types.SimpleNamespace(FasterQwen3TTS=object)
+        fake_torch_module = types.SimpleNamespace(float16="fake-float16")
+        fake_omnivoice_module = types.SimpleNamespace(OmniVoice=object)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            config = ServerConfig(
-                voices_dir=Path(temp_dir) / "voices",
-                host="0.0.0.0",
-                port=8000,
-                model="0.6B",
-                device="cuda",
-                dtype="bfloat16",
-                default_language="Auto",
-                chunk_size=8,
-                append_silence=True,
-                non_streaming_mode=False,
-                max_text_length=4000,
-                model_cache_dir=None,
-                prefetch_manifest_path=Path(temp_dir) / "prefetched-models.json",
-                warmup=False,
-                warmup_text="Hello from fatterqwen.",
-                wyoming_enabled=True,
-                wyoming_uri="tcp://0.0.0.0:10300",
-                wyoming_audio_chunk_samples=4096,
-                log_level="INFO",
+            config = build_test_config(temp_dir, model="acme/custom-omnivoice")
+            service = TtsService(
+                config=config,
+                voice_registry=FakeVoiceRegistry([build_test_voice_entry(temp_dir)]),
             )
-            service = TtsService(config, Mock())
 
             with (
-                patch("fatterqwen.service.configure_huggingface_cache", return_value=None),
-                patch("fatterqwen.service.resolve_prefetched_model_path", return_value=service.model_id),
-                patch("fatterqwen.service.is_huggingface_offline_mode_enabled", return_value=True),
+                patch("fattervoice.service.configure_huggingface_cache", return_value=None),
+                patch("fattervoice.service.resolve_prefetched_model_path", return_value=service.model_id),
+                patch("fattervoice.service.is_huggingface_offline_mode_enabled", return_value=True),
                 patch.dict(
                     sys.modules,
                     {
                         "torch": fake_torch_module,
-                        "faster_qwen3_tts": fake_loader_module,
+                        "omnivoice": fake_omnivoice_module,
                     },
                 ),
-                patch.dict(os.environ, {"MODEL_SELECTION_HINT": "1.7B"}, clear=False),
+                patch.dict(os.environ, {"MODEL_SELECTION_HINT": "omnivoice"}, clear=False),
             ):
                 with self.assertRaises(FileNotFoundError) as raised_error:
                     service._load_model()
-            service.close()
 
         self.assertIn("MODEL_SELECTION=all", str(raised_error.exception))
-        self.assertIn("1.7B", str(raised_error.exception))
-        self.assertIn("0.6B", str(raised_error.exception))
+        self.assertIn("omnivoice", str(raised_error.exception))
+        self.assertIn("acme/custom-omnivoice", str(raised_error.exception))
 
-
-class _FakeCloneModel:
-    """Small fake synthesis model used to exercise service orchestration paths.
-
-    Usage:
-        The long-form service tests install this fake model directly on the
-        service instance so they can verify chunk planning and streaming behavior
-        without importing CUDA or the real upstream model.
-
-    Parameters:
-        None.
-
-    Returns:
-        A lightweight object exposing the subset of model methods used by the
-        service tests.
-    """
-
-    sample_rate = 24000
-
-    def __init__(self) -> None:
-        """Initialize counters that capture how the service calls the fake model.
+    def test_synthesize_reuses_cached_voice_prompt_and_normalizes_language(self) -> None:
+        """Ensure repeated synthesis requests reuse one cached OmniVoice prompt.
 
         Usage:
-            Each test creates a fresh fake model so call counts and captured text
-            chunks start from a clean state.
+            Voice cloning performance depends heavily on caching the prompt tokens
+            derived from the reference audio. This test verifies that the service
+            only prepares the prompt once and forwards normalized language / speed
+            values during subsequent generation calls.
 
         Parameters:
             None.
 
         Returns:
-            None. The fake model tracks synchronous and streaming calls in place.
-        """
-        self.generated_texts: list[str] = []
-        self.streaming_call_count = 0
-
-    def generate_voice_clone(self, **kwargs) -> tuple[list[np.ndarray], int]:
-        """Return a deterministic waveform whose value encodes the call index.
-
-        Usage:
-            The service's buffered and long-form chunked code paths call this
-            method exactly as they would the real upstream model.
-
-        Parameters:
-            **kwargs: Model-generation keyword arguments, including the `text`
-                chunk selected by the service.
-
-        Returns:
-            A tuple of `([waveform], sample_rate)` matching the real upstream API.
-        """
-        text = str(kwargs["text"])
-        self.generated_texts.append(text)
-        amplitude = 0.2 + (0.05 * len(self.generated_texts))
-        waveform = np.full(600, amplitude, dtype=np.float32)
-        return [waveform], self.sample_rate
-
-    def generate_voice_clone_streaming(self, **kwargs):
-        """Record that streaming was used and yield one deterministic chunk.
-
-        Usage:
-            The short-request streaming test path still uses this method, while
-            the long-form chunked streaming test asserts that it is not called.
-
-        Parameters:
-            **kwargs: Model-generation keyword arguments forwarded by the service.
-
-        Returns:
-            A generator yielding one `(waveform, sample_rate, timing)` tuple.
-        """
-        self.streaming_call_count += 1
-        yield np.full(320, 0.25, dtype=np.float32), self.sample_rate, {"chunk_index": 0}
-
-
-class LongformServiceTests(unittest.TestCase):
-    """Verify the wrapper's long-form quality orchestration around the upstream model."""
-
-    def _build_config(self) -> ServerConfig:
-        """Create a test config that forces long-form chunking for short sentences.
-
-        Usage:
-            The service tests use an intentionally tiny chunk threshold so they can
-            exercise multi-call orchestration with small synthetic request text.
-
-        Parameters:
-            None.
-
-        Returns:
-            A `ServerConfig` tailored for deterministic long-form service tests.
-        """
-        return ServerConfig(
-            voices_dir=Path("/tmp/voices"),
-            host="0.0.0.0",
-            port=8000,
-            model="1.7B",
-            device="cuda",
-            dtype="bfloat16",
-            default_language="Auto",
-            chunk_size=8,
-            append_silence=True,
-            non_streaming_mode=False,
-            max_text_length=4000,
-            model_cache_dir=None,
-            prefetch_manifest_path=None,
-            warmup=False,
-            warmup_text="Hello from fatterqwen.",
-            wyoming_enabled=True,
-            wyoming_uri="tcp://0.0.0.0:10300",
-            wyoming_audio_chunk_samples=4096,
-            log_level="INFO",
-            postprocess_output_audio=False,
-            longform_chunking_enabled=True,
-            longform_chunk_threshold_units=12,
-            longform_target_units=10,
-            longform_min_units=4,
-            longform_crossfade_milliseconds=20,
-            longform_gap_milliseconds=30,
-        )
-
-    def _build_short_streaming_config(self) -> ServerConfig:
-        """Create a test config that keeps one short request in a single chunk.
-
-        Usage:
-            The short-streaming quality test needs postprocessing enabled while
-            still avoiding the long-form chunk planner, so this helper returns a
-            config with a very large chunk threshold.
-
-        Parameters:
-            None.
-
-        Returns:
-            A `ServerConfig` suited for single-chunk buffered streaming tests.
-        """
-        return ServerConfig(
-            voices_dir=Path("/tmp/voices"),
-            host="0.0.0.0",
-            port=8000,
-            model="1.7B",
-            device="cuda",
-            dtype="bfloat16",
-            default_language="Auto",
-            chunk_size=8,
-            append_silence=True,
-            non_streaming_mode=False,
-            max_text_length=4000,
-            model_cache_dir=None,
-            prefetch_manifest_path=None,
-            warmup=False,
-            warmup_text="Hello from fatterqwen.",
-            wyoming_enabled=True,
-            wyoming_uri="tcp://0.0.0.0:10300",
-            wyoming_audio_chunk_samples=4096,
-            log_level="INFO",
-            postprocess_output_audio=True,
-            longform_chunking_enabled=True,
-            longform_chunk_threshold_units=1000,
-            longform_target_units=400,
-            longform_min_units=80,
-            longform_crossfade_milliseconds=20,
-            longform_gap_milliseconds=30,
-        )
-
-    def _build_voice_entry(self, temp_dir: str) -> VoiceEntry:
-        """Create a minimal validated-style voice entry for service orchestration tests.
-
-        Usage:
-            The tests patch prompt preparation, so the voice entry only needs to
-            provide stable metadata for request validation.
-
-        Parameters:
-            temp_dir: Temporary directory used to hold synthetic file paths.
-
-        Returns:
-            A `VoiceEntry` with predictable test paths and transcript text.
-        """
-        return VoiceEntry(
-            voice_id="demo",
-            audio_path=Path(temp_dir) / "demo.wav",
-            transcript_path=Path(temp_dir) / "demo.txt",
-            transcript="Reference transcript.",
-        )
-
-    def test_synthesize_chunks_large_requests_into_multiple_model_calls(self) -> None:
-        """Ensure buffered synthesis uses multiple upstream calls for long text.
-
-        Usage:
-            This test verifies the highest-impact quality change: large requests
-            are split into several smaller model calls and then merged instead of
-            being forced through one monolithic generation pass.
-
-        Parameters:
-            None.
-
-        Returns:
-            None. The test asserts that multiple model calls occur and a waveform
-            is returned successfully.
+            None. The test asserts on prompt-cache reuse and generation kwargs.
         """
         with tempfile.TemporaryDirectory() as temp_dir:
-            voice_entry = self._build_voice_entry(temp_dir)
-            voice_registry = Mock()
-            voice_registry.get.return_value = voice_entry
-            service = TtsService(self._build_config(), voice_registry)
-            service._model = _FakeCloneModel()
-            prepared_voice = PreparedVoiceConditioning(
-                voice_id="demo",
-                audio_path=Path(temp_dir) / "prepared.wav",
-                transcript="Reference transcript.",
-                reference_rms=0.2,
-                prompt_rms=0.2,
+            fake_model = FakeOmniVoiceModel()
+            service = TtsService(
+                config=build_test_config(temp_dir),
+                voice_registry=FakeVoiceRegistry([build_test_voice_entry(temp_dir)]),
             )
+            service._model = fake_model
 
-            with patch.object(
-                service,
-                "_resolve_prepared_voice_conditioning",
-                return_value=prepared_voice,
-            ):
-                waveform, sample_rate = asyncio.run(
-                    service.synthesize(
+            async def run_test() -> None:
+                await service.synthesize(
+                    SynthesisRequest(
+                        text="Hello there",
+                        voice_id="demo",
+                        language="en-US",
+                        speed=1.25,
+                    )
+                )
+                await service.synthesize(
+                    SynthesisRequest(
+                        text="Second line",
+                        voice_id="demo",
+                        language="en-US",
+                        speed=1.0,
+                    )
+                )
+
+            asyncio.run(run_test())
+
+        self.assertEqual(len(fake_model.created_prompts), 1)
+        self.assertEqual(len(fake_model.generated_requests), 2)
+        self.assertEqual(fake_model.generated_requests[0]["language"], "en")
+        self.assertEqual(fake_model.generated_requests[0]["speed"], 1.25)
+        self.assertEqual(
+            fake_model.generated_requests[0]["voice_clone_prompt"],
+            fake_model.generated_requests[1]["voice_clone_prompt"],
+        )
+
+    def test_stream_low_latency_pcm_chunks_synthesizes_sentence_segments_separately(self) -> None:
+        """Ensure explicit low-latency streaming reuses cached prompts across segments.
+
+        Usage:
+            The OpenAI adapter now uses a sentence-segmented streaming path when
+            clients explicitly request `stream=true`. This test verifies that the
+            service synthesizes each sentence-like segment separately while still
+            reusing the same cached OmniVoice voice-clone prompt object.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts on emitted chunks, per-segment generation, and
+            prompt reuse across all generated segments.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_model = FakeOmniVoiceModel()
+            service = TtsService(
+                config=build_test_config(temp_dir),
+                voice_registry=FakeVoiceRegistry([build_test_voice_entry(temp_dir)]),
+            )
+            service._model = fake_model
+
+            async def collect_chunks() -> list[bytes]:
+                return [
+                    chunk
+                    async for chunk in service.stream_low_latency_pcm_chunks(
                         SynthesisRequest(
-                            text="Alpha sentence. Beta sentence. Gamma sentence.",
+                            text="Hello world. Second line without drama!",
                             voice_id="demo",
                         )
                     )
-                )
-            service.close()
+                ]
 
-        self.assertEqual(sample_rate, 24000)
-        self.assertGreater(waveform.shape[0], 0)
-        self.assertGreater(len(service._model.generated_texts), 1)
+            streamed_chunks = asyncio.run(collect_chunks())
 
-    def test_stream_pcm_chunks_rejects_invalid_requests_before_iteration(self) -> None:
-        """Ensure streaming validation runs before an async iterator is handed out.
+        self.assertTrue(streamed_chunks)
+        self.assertEqual(len(fake_model.created_prompts), 1)
+        self.assertEqual(len(fake_model.generated_requests), 2)
+        self.assertEqual(
+            [generation_request["text"] for generation_request in fake_model.generated_requests],
+            ["Hello world.", "Second line without drama!"],
+        )
+        self.assertEqual(
+            fake_model.generated_requests[0]["voice_clone_prompt"],
+            fake_model.generated_requests[1]["voice_clone_prompt"],
+        )
+
+    def test_stream_pcm_chunks_buffers_full_audio_into_pcm(self) -> None:
+        """Ensure the service still exposes buffered chunked PCM streaming semantics.
 
         Usage:
-            The HTTP adapter now relies on `TtsService.stream_pcm_chunks(...)` to
-            fail fast so it can return a normal 400 response before opening a
-            chunked response body.
+            OmniVoice currently exposes buffered generation rather than a public
+            low-level incremental streaming API. This test verifies that the
+            quality-first chunked path still performs one full synthesis request
+            before yielding PCM bytes.
 
         Parameters:
             None.
 
         Returns:
-            None. The test asserts that invalid text raises immediately when the
-            streaming iterator is requested.
-        """
-        voice_registry = Mock()
-        service = TtsService(self._build_config(), voice_registry)
-
-        with self.assertRaises(ValueError):
-            service.stream_pcm_chunks(
-                SynthesisRequest(
-                    text="   ",
-                    voice_id="demo",
-                )
-            )
-
-        voice_registry.get.assert_not_called()
-        service.close()
-
-    def test_stream_pcm_chunks_defers_voice_preparation_until_iteration(self) -> None:
-        """Ensure stream creation validates eagerly without preprocessing the voice yet.
-
-        Usage:
-            The HTTP adapter relies on immediate request validation, but voice
-            preparation should still be deferred until the client actually starts
-            consuming the streaming response.
-
-        Parameters:
-            None.
-
-        Returns:
-            None. The test asserts that requesting the async iterator does not
-            yet call the voice-preparation helper.
+            None. The test asserts that at least one non-empty PCM chunk is
+            emitted and that only one OmniVoice generation call was required.
         """
         with tempfile.TemporaryDirectory() as temp_dir:
-            voice_entry = self._build_voice_entry(temp_dir)
-            voice_registry = Mock()
-            voice_registry.get.return_value = voice_entry
-            service = TtsService(self._build_config(), voice_registry)
+            fake_model = FakeOmniVoiceModel()
+            service = TtsService(
+                config=build_test_config(temp_dir),
+                voice_registry=FakeVoiceRegistry([build_test_voice_entry(temp_dir)]),
+            )
+            service._model = fake_model
 
-            with patch.object(service, "_resolve_prepared_voice_conditioning") as prepare_voice:
-                stream = service.stream_pcm_chunks(
-                    SynthesisRequest(
-                        text="A short sentence.",
-                        voice_id="demo",
+            async def collect_chunks() -> list[bytes]:
+                return [
+                    chunk
+                    async for chunk in service.stream_pcm_chunks(
+                        SynthesisRequest(text="Buffered streaming test", voice_id="demo")
                     )
-                )
+                ]
 
-            self.assertIsNotNone(stream)
-            prepare_voice.assert_not_called()
-            asyncio.run(stream.aclose())
-            service.close()
+            streamed_chunks = asyncio.run(collect_chunks())
 
-    def test_stream_pcm_chunks_closing_consumer_does_not_leave_producer_thread_stuck(self) -> None:
-        """Ensure early stream shutdown does not leave the producer thread blocked forever.
-
-        Usage:
-            Streaming clients can disconnect after receiving only part of the
-            response. This test verifies that the internal producer exits cleanly
-            even when bounded queue backpressure is present during shutdown.
-
-        Parameters:
-            None.
-
-        Returns:
-            None. The test asserts that one chunk is received and the producer
-            thread terminates after the consumer closes the stream.
-        """
-        async def consume_one_chunk_and_close(service: TtsService) -> bytes:
-            """Read one PCM chunk and then close the stream to simulate disconnect.
-
-            Usage:
-                The shutdown regression only appears when the consumer stops
-                draining the async iterator early, so this helper closes the
-                stream immediately after the first yielded chunk.
-
-            Parameters:
-                service: The `TtsService` instance under test.
-
-            Returns:
-                The first PCM chunk yielded by the service.
-            """
-            stream = service.stream_pcm_chunks(
-                SynthesisRequest(
-                    text="A short sentence.",
-                    voice_id="demo",
-                )
-            )
-            first_chunk = await anext(stream)
-            await stream.aclose()
-            return first_chunk
-
-        def fast_pcm_chunk_iterator(*, request: SynthesisRequest, prepared_voice: PreparedVoiceConditioning):
-            """Yield many PCM chunks quickly so the internal queue can fill under backpressure.
-
-            Usage:
-                The service under test consumes this generator inside its
-                producer thread. A burst of chunks makes it much more likely that
-                the queue is full when the consumer disconnects.
-
-            Parameters:
-                request: The normalized request supplied by the service.
-                prepared_voice: The prepared conditioning bundle supplied by the service.
-
-            Returns:
-                A synchronous iterator of raw PCM byte chunks.
-            """
-            _ = request, prepared_voice
-            for _chunk_index in range(64):
-                yield b"\x00\x01" * 128
-
-        created_threads: list[threading.Thread] = []
-        real_thread_type = threading.Thread
-
-        def build_recording_thread(*args, **kwargs) -> threading.Thread:
-            """Create a real thread while recording the producer for shutdown assertions.
-
-            Usage:
-                The test patches `fatterqwen.service.threading.Thread` with this
-                helper so it can later join only the background synthesis
-                producer thread, without confusing it with executor worker
-                threads created elsewhere in the async stack.
-
-            Parameters:
-                *args: Positional arguments forwarded to `threading.Thread`.
-                **kwargs: Keyword arguments forwarded to `threading.Thread`.
-
-            Returns:
-                The created `threading.Thread` instance.
-            """
-            thread = real_thread_type(*args, **kwargs)
-            target = kwargs.get("target")
-            if callable(target) and getattr(target, "__name__", "") == "produce_streaming_audio":
-                created_threads.append(thread)
-            return thread
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            voice_entry = self._build_voice_entry(temp_dir)
-            voice_registry = Mock()
-            voice_registry.get.return_value = voice_entry
-            service = TtsService(self._build_config(), voice_registry)
-            service._model = _FakeCloneModel()
-            prepared_voice = PreparedVoiceConditioning(
-                voice_id="demo",
-                audio_path=Path(temp_dir) / "prepared.wav",
-                transcript="Reference transcript.",
-                reference_rms=0.2,
-                prompt_rms=0.2,
-            )
-
-            with (
-                patch.object(
-                    service,
-                    "_resolve_prepared_voice_conditioning",
-                    return_value=prepared_voice,
-                ),
-                patch.object(
-                    service,
-                    "_plan_request_chunks",
-                    return_value=["A short sentence."],
-                ),
-                patch.object(
-                    service,
-                    "_stream_short_request_pcm_chunks",
-                    side_effect=fast_pcm_chunk_iterator,
-                ),
-                patch("fatterqwen.service.threading.Thread", side_effect=build_recording_thread),
-            ):
-                first_chunk = asyncio.run(consume_one_chunk_and_close(service))
-
-            service.close()
-
-        self.assertGreater(len(first_chunk), 0)
-        self.assertEqual(len(created_threads), 1)
-        created_threads[0].join(timeout=2.0)
-        self.assertFalse(created_threads[0].is_alive())
-
-    def test_stream_pcm_chunks_uses_chunked_longform_path_without_upstream_streaming(self) -> None:
-        """Ensure long-form streaming uses chunk-level synthesis rather than token streaming.
-
-        Usage:
-            The quality-focused streaming path must bypass the upstream token-level
-            streamer for chunked long-form requests so cleaned and smoothed audio
-            can be emitted instead.
-
-        Parameters:
-            None.
-
-        Returns:
-            None. The test asserts that PCM bytes are produced, several buffered
-            model calls are made, and the upstream streaming generator is skipped.
-        """
-        async def collect_pcm_chunks(service: TtsService) -> bytes:
-            """Collect every emitted PCM chunk into one payload for assertions.
-
-            Usage:
-                The test uses this helper to consume the async service iterator in
-                a compact, deterministic way.
-
-            Parameters:
-                service: The `TtsService` instance under test.
-
-            Returns:
-                One concatenated byte payload containing every emitted PCM chunk.
-            """
-            payload_parts: list[bytes] = []
-            async for pcm_chunk in service.stream_pcm_chunks(
-                SynthesisRequest(
-                    text="Alpha sentence. Beta sentence. Gamma sentence.",
-                    voice_id="demo",
-                )
-            ):
-                payload_parts.append(pcm_chunk)
-            return b"".join(payload_parts)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            voice_entry = self._build_voice_entry(temp_dir)
-            voice_registry = Mock()
-            voice_registry.get.return_value = voice_entry
-            service = TtsService(self._build_config(), voice_registry)
-            service._model = _FakeCloneModel()
-            prepared_voice = PreparedVoiceConditioning(
-                voice_id="demo",
-                audio_path=Path(temp_dir) / "prepared.wav",
-                transcript="Reference transcript.",
-                reference_rms=0.2,
-                prompt_rms=0.2,
-            )
-
-            with patch.object(
-                service,
-                "_resolve_prepared_voice_conditioning",
-                return_value=prepared_voice,
-            ):
-                pcm_payload = asyncio.run(collect_pcm_chunks(service))
-            service.close()
-
-        self.assertGreater(len(pcm_payload), 0)
-        self.assertGreater(len(service._model.generated_texts), 1)
-        self.assertEqual(service._model.streaming_call_count, 0)
-
-    def test_stream_pcm_chunks_buffers_short_requests_when_output_postprocessing_is_enabled(self) -> None:
-        """Ensure short streamed requests use buffered cleanup instead of raw upstream PCM.
-
-        Usage:
-            The quality refactor promises that generated audio can be cleaned and
-            edge-finished before being returned. This test verifies that enabling
-            postprocessing keeps short streamed requests off the raw upstream
-            streaming path so that cleanup can be applied first.
-
-        Parameters:
-            None.
-
-        Returns:
-            None. The test asserts that a short streamed request emits PCM bytes
-            without invoking the upstream streaming generator.
-        """
-        async def collect_pcm_chunks(service: TtsService) -> bytes:
-            """Collect the service's async PCM iterator into one payload.
-
-            Usage:
-                The test uses this helper to consume the streaming API in one
-                place while keeping the assertions focused on orchestration.
-
-            Parameters:
-                service: The `TtsService` instance under test.
-
-            Returns:
-                The concatenated PCM payload emitted by the service.
-            """
-            payload_parts: list[bytes] = []
-            async for pcm_chunk in service.stream_pcm_chunks(
-                SynthesisRequest(
-                    text="A short sentence.",
-                    voice_id="demo",
-                )
-            ):
-                payload_parts.append(pcm_chunk)
-            return b"".join(payload_parts)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            voice_entry = self._build_voice_entry(temp_dir)
-            voice_registry = Mock()
-            voice_registry.get.return_value = voice_entry
-            service = TtsService(self._build_short_streaming_config(), voice_registry)
-            service._model = _FakeCloneModel()
-            prepared_voice = PreparedVoiceConditioning(
-                voice_id="demo",
-                audio_path=Path(temp_dir) / "prepared.wav",
-                transcript="Reference transcript.",
-                reference_rms=0.2,
-                prompt_rms=0.2,
-            )
-
-            with patch.object(
-                service,
-                "_resolve_prepared_voice_conditioning",
-                return_value=prepared_voice,
-            ):
-                pcm_payload = asyncio.run(collect_pcm_chunks(service))
-            service.close()
-
-        self.assertGreater(len(pcm_payload), 0)
-        self.assertEqual(len(service._model.generated_texts), 1)
-        self.assertEqual(service._model.streaming_call_count, 0)
+        self.assertTrue(streamed_chunks)
+        self.assertTrue(all(streamed_chunk for streamed_chunk in streamed_chunks))
+        self.assertEqual(len(fake_model.generated_requests), 1)
 
 
 if __name__ == "__main__":

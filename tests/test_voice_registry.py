@@ -7,7 +7,7 @@ import unittest
 import wave
 from pathlib import Path
 
-from fatterqwen.voice_registry import VoiceRegistry, VoiceRegistryError
+from fattervoice.voice_registry import VoiceRegistry, VoiceRegistryError
 
 
 

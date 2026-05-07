@@ -3,13 +3,13 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "fatterqwen"
+name = "fattervoice"
 version = "0.1.0"
-description = "Production-oriented OpenAI-compatible and Wyoming TTS server for faster-qwen3-tts"
+description = "Production-oriented OpenAI-compatible and Wyoming TTS server for OmniVoice"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "eca" }]
-keywords = ["tts", "qwen", "wyoming", "fastapi", "cuda"]
+keywords = ["tts", "omnivoice", "voice-cloning", "wyoming", "fastapi", "cuda"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -23,14 +23,15 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.115.0",
-    "faster-qwen3-tts>=0.2.5",
     "huggingface-hub>=0.24.0",
     "numpy>=1.26.0",
+    "omnivoice==0.1.5",
     "pydantic>=2.8.0",
     "sentence-stream>=1.2.0,<2",
     "soundfile>=0.12.1",
     "torch>=2.5.1",
     "torchaudio>=2.5.1",
+    "transformers>=5.3.0",
     "uvicorn[standard]>=0.30.0",
     "wyoming>=1.8.0,<2",
 ]
@@ -40,15 +41,30 @@ mp3 = ["pydub>=0.25.1"]
 dev = ["pytest>=8.0.0", "httpx>=0.27.0"]
 
 [project.scripts]
-fatterqwen = "fatterqwen.cli:main"
-fatterqwen-prefetch = "fatterqwen.prefetch:main"
+fattervoice = "fattervoice.cli:main"
+fattervoice-prefetch = "fattervoice.prefetch:main"
 
 [project.urls]
 Homepage = "https://github.com/justinlime/fatterqwen"
 Repository = "https://github.com/justinlime/fatterqwen"
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/AGENTS.md",
+    "/Dockerfile",
+    "/README.md",
+    "/docker-entrypoint.sh",
+    "/fattervoice",
+    "/pyproject.toml",
+    "/tests",
+    "/uv.lock",
+]
+
 [tool.hatch.build.targets.wheel]
-packages = ["fatterqwen"]
+packages = ["fattervoice"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [[tool.uv.index]]
 name = "pytorch-cu126"
@@ -56,6 +72,5 @@ url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.uv.sources]
-faster-qwen3-tts = { path = "faster-qwen3-tts" }
 torch = { index = "pytorch-cu126" }
 torchaudio = { index = "pytorch-cu126" }

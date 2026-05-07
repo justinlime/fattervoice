@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fatterqwen.hf_cache import (
+from fattervoice.hf_cache import (
     configure_huggingface_cache,
     is_huggingface_offline_mode_enabled,
 )

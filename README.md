@@ -1,21 +1,22 @@
-# fatterqwen
+# fattervoice
 
-`fatterqwen` is a production-oriented Python wrapper around `faster-qwen3-tts`.
+`fattervoice` is a production-oriented Python wrapper around **OmniVoice**.
 
-It keeps the upstream CUDA-graph inference engine intact and adds:
+The repository name is historical, but the runtime backend is now fully OmniVoice-based. The server keeps one shared synthesis service and adds:
 
 - OpenAI-compatible `POST /v1/audio/speech`
-- streaming WAV/PCM HTTP responses
+- chunked WAV/PCM HTTP responses
 - Wyoming protocol support for Home Assistant
-- streamed Wyoming audio chunks and streamed Wyoming text-input handling
+- streamed Wyoming text-input handling with emitted audio chunks
 - a validated `voices/` directory registry based on `<voice>.<audio>` + `<voice>.txt`
 - `uv`-based project management and Docker builds
+- offline-oriented model prefetch for Docker/runtime use
 
 ## Repository layout
 
-- `faster-qwen3-tts/`: upstream/reference inference engine
-- `fatterqwen/`: wrapper package implemented in this repository
+- `fattervoice/`: wrapper package implemented in this repository
 - `voices/`: runtime voice directory mounted or created by the user
+- local development may temporarily include extra reference material, but the runtime depends only on the published `omnivoice` package and the code in this wrapper project
 
 ## Voice directory contract
 
@@ -33,9 +34,9 @@ Examples:
 
 The basename becomes the public `voice` identifier exposed through both the OpenAI-compatible API and Wyoming.
 
-## Local development with `uv`
+Because `fattervoice` requires transcripts for every voice, OmniVoice auto-ASR is intentionally **not** part of the normal server flow. This keeps voice cloning faster, more stable, and easier to run offline.
 
-This wrapper currently requires Python 3.11+ because the upstream `qwen-tts` dependency now resolves `onnxruntime` wheels that are no longer published for CPython 3.10.
+## Local development with `uv`
 
 Install dependencies:
 
@@ -46,9 +47,9 @@ uv sync --extra mp3 --extra dev
 Run the server:
 
 ```bash
-uv run fatterqwen \
+uv run fattervoice \
   --voices-dir ./voices \
-  --model 1.7B \
+  --model omnivoice \
   --host 0.0.0.0 \
   --port 8000 \
   --wyoming-uri tcp://0.0.0.0:10300
@@ -60,44 +61,46 @@ CLI arguments take precedence, and environment variables act as fallbacks.
 
 | CLI flag | ENV fallback | Default |
 | --- | --- | --- |
-| `--voices-dir` | `FATTERQWEN_VOICES_DIR` | `voices` |
-| `--host` | `FATTERQWEN_HOST` | `0.0.0.0` |
-| `--port` | `FATTERQWEN_PORT` | `8000` |
-| `--model` | `FATTERQWEN_MODEL` | `1.7B` |
-| `--device` | `FATTERQWEN_DEVICE` | `cuda` |
-| `--dtype` | `FATTERQWEN_DTYPE` | `bfloat16` |
-| `--default-language` | `FATTERQWEN_DEFAULT_LANGUAGE` | `Auto` |
-| `--chunk-size` | `FATTERQWEN_CHUNK_SIZE` | `8` |
-| `--append-silence` / `--no-append-silence` | `FATTERQWEN_APPEND_SILENCE` | `true` |
-| `--non-streaming-mode` / `--no-non-streaming-mode` | `FATTERQWEN_NON_STREAMING_MODE` | `false` |
-| `--max-text-length` | `FATTERQWEN_MAX_TEXT_LENGTH` | `4000` |
-| `--preprocess-reference-audio` / `--no-preprocess-reference-audio` | `FATTERQWEN_PREPROCESS_REFERENCE_AUDIO` | `true` |
-| `--normalize-reference-transcript` / `--no-normalize-reference-transcript` | `FATTERQWEN_NORMALIZE_REFERENCE_TRANSCRIPT` | `true` |
-| `--reference-prompt-target-rms` | `FATTERQWEN_REFERENCE_PROMPT_TARGET_RMS` | `0.1` |
-| `--postprocess-output-audio` / `--no-postprocess-output-audio` | `FATTERQWEN_POSTPROCESS_OUTPUT_AUDIO` | `true` |
-| `--longform-chunking` / `--no-longform-chunking` | `FATTERQWEN_LONGFORM_CHUNKING` | `true` |
-| `--longform-chunk-threshold-units` | `FATTERQWEN_LONGFORM_CHUNK_THRESHOLD_UNITS` | `320` |
-| `--longform-target-units` | `FATTERQWEN_LONGFORM_TARGET_UNITS` | `200` |
-| `--longform-min-units` | `FATTERQWEN_LONGFORM_MIN_UNITS` | `70` |
-| `--longform-crossfade-milliseconds` | `FATTERQWEN_LONGFORM_CROSSFADE_MILLISECONDS` | `80` |
-| `--longform-gap-milliseconds` | `FATTERQWEN_LONGFORM_GAP_MILLISECONDS` | `120` |
-| `--model-cache-dir` | `FATTERQWEN_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
-| `--prefetch-manifest` | `FATTERQWEN_PREFETCH_MANIFEST` | empty / unset |
-| `--warmup` / `--no-warmup` | `FATTERQWEN_WARMUP` | `false` |
-| `--warmup-text` | `FATTERQWEN_WARMUP_TEXT` | `Hello from fatterqwen.` |
-| `--wyoming-enabled` / `--no-wyoming-enabled` | `FATTERQWEN_WYOMING_ENABLED` | `true` |
-| `--wyoming-uri` | `FATTERQWEN_WYOMING_URI` | `tcp://0.0.0.0:10300` |
-| `--wyoming-audio-chunk-samples` | `FATTERQWEN_WYOMING_AUDIO_CHUNK_SAMPLES` | `4096` |
-| `--log-level` | `FATTERQWEN_LOG_LEVEL` | `INFO` |
+| `--voices-dir` | `FATTERVOICE_VOICES_DIR` | `voices` |
+| `--host` | `FATTERVOICE_HOST` | `0.0.0.0` |
+| `--port` | `FATTERVOICE_PORT` | `8000` |
+| `--model` | `FATTERVOICE_MODEL` | `omnivoice` |
+| `--device` | `FATTERVOICE_DEVICE` | `cuda:0` |
+| `--dtype` | `FATTERVOICE_DTYPE` | `float16` |
+| `--default-language` | `FATTERVOICE_DEFAULT_LANGUAGE` | `auto` |
+| `--max-text-length` | `FATTERVOICE_MAX_TEXT_LENGTH` | `4000` |
+| `--num-step` | `FATTERVOICE_NUM_STEP` | `16` |
+| `--guidance-scale` | `FATTERVOICE_GUIDANCE_SCALE` | `2.0` |
+| `--denoise` / `--no-denoise` | `FATTERVOICE_DENOISE` | `true` |
+| `--t-shift` | `FATTERVOICE_T_SHIFT` | `0.1` |
+| `--position-temperature` | `FATTERVOICE_POSITION_TEMPERATURE` | `5.0` |
+| `--class-temperature` | `FATTERVOICE_CLASS_TEMPERATURE` | `0.0` |
+| `--layer-penalty-factor` | `FATTERVOICE_LAYER_PENALTY_FACTOR` | `5.0` |
+| `--preprocess-voice-clone-prompt` / `--no-preprocess-voice-clone-prompt` | `FATTERVOICE_PREPROCESS_VOICE_CLONE_PROMPT` | `true` |
+| `--postprocess-output-audio` / `--no-postprocess-output-audio` | `FATTERVOICE_POSTPROCESS_OUTPUT_AUDIO` | `true` |
+| `--audio-chunk-duration` | `FATTERVOICE_AUDIO_CHUNK_DURATION` | `15.0` |
+| `--audio-chunk-threshold` | `FATTERVOICE_AUDIO_CHUNK_THRESHOLD` | `30.0` |
+| `--model-cache-dir` | `FATTERVOICE_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
+| `--prefetch-manifest` | `FATTERVOICE_PREFETCH_MANIFEST` | empty / unset |
+| `--warmup` / `--no-warmup` | `FATTERVOICE_WARMUP` | `false` |
+| `--warmup-text` | `FATTERVOICE_WARMUP_TEXT` | `Hello from fattervoice.` |
+| `--wyoming-enabled` / `--no-wyoming-enabled` | `FATTERVOICE_WYOMING_ENABLED` | `true` |
+| `--wyoming-uri` | `FATTERVOICE_WYOMING_URI` | `tcp://0.0.0.0:10300` |
+| `--wyoming-audio-chunk-samples` | `FATTERVOICE_WYOMING_AUDIO_CHUNK_SAMPLES` | `4096` |
+| `--log-level` | `FATTERVOICE_LOG_LEVEL` | `INFO` |
 
 Boolean environment variables accept `1`, `true`, `yes`, or `on` for true, and `0`, `false`, `no`, or `off` for false.
 
-The wrapper now also applies a built-in voice-cloning quality pipeline before and after inference:
+### OmniVoice tuning defaults
 
-- reference audio can be silence-compacted and quiet prompts can be RMS-normalized before caching
-- reference transcripts can receive missing terminal punctuation for more stable prosody
-- long requests can be split into multiple weighted text chunks with smoothed boundaries
-- generated audio can be silence-compacted and edge-faded before being returned
+The server is tuned for **fast voice cloning with strong retained quality**:
+
+- voice-clone prompts are precomputed and cached at startup
+- `num_step=16` is the default speed-focused OmniVoice setting
+- reference transcripts remain mandatory for stable cloning and offline operation
+- OmniVoice prompt preprocessing and output postprocessing remain enabled by default
+
+If you want to bias further toward quality, increase `--num-step` to `32`.
 
 ## OpenAI-compatible API
 
@@ -108,14 +111,26 @@ curl http://localhost:8000/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{
         "model": "tts-1",
-        "input": "Hello from fatterqwen.",
+        "input": "Hello from fattervoice.",
         "voice": "hank",
-        "response_format": "wav"
+        "response_format": "wav",
+        "speed": 1.0
       }' \
   --output speech.wav
 ```
 
-Streaming works automatically for `wav` and `pcm`. `mp3` is returned as a complete response because it must be encoded after generation.
+`speed` is forwarded to OmniVoice.
+
+### Streaming behavior
+
+`wav` and `pcm` responses are still available as chunked HTTP responses, but OmniVoice currently exposes **buffered full-audio generation** rather than a documented true incremental audio streaming API. In practice that means:
+
+- default chunked WAV/PCM responses still stream bytes after each full buffered OmniVoice generation call completes
+- explicit `stream=true` on WAV/PCM switches to a lower-latency sentence-segmented path that synthesizes one sentence-like segment at a time to improve time-to-first-audio for longer requests
+- Wyoming sentence-streaming still works by synthesizing completed text chunks
+- true model-incremental audio streaming is still not claimed because the backend does not currently document that capability
+
+`mp3` is returned as a complete response because it must be encoded after generation.
 
 ## Wyoming support
 
@@ -128,36 +143,32 @@ The Wyoming handler:
 - handles `synthesize`
 - handles `synthesize-start` / `synthesize-chunk` / `synthesize-stop`
 - emits `audio-start` / `audio-chunk` / `audio-stop`
-- buffers incoming streaming text on sentence boundaries before synthesis, mirroring the current Wyoming ecosystem pattern used by `wyoming-piper`
+- buffers incoming streaming text on sentence boundaries before synthesis
 
 ## Prefetching models for offline Docker/runtime use
 
-Prefetch a model into the Hugging Face cache:
+Prefetch the built-in OmniVoice model into the Hugging Face cache:
 
 ```bash
-uv run fatterqwen-prefetch --model 1.7B
+uv run fattervoice-prefetch --model omnivoice
 ```
+
+This command also prefetches the auxiliary Higgs audio tokenizer repository required by OmniVoice when it is not already embedded in the resolved snapshot layout.
 
 ### Prefetch command reference
 
 | CLI flag | ENV fallback | Default |
 | --- | --- | --- |
-| `--model` | — | `1.7B` |
-| `--cache-dir` | `FATTERQWEN_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
-| `--manifest` | `FATTERQWEN_PREFETCH_MANIFEST` | empty / unset |
+| `--model` | — | `omnivoice` |
+| `--cache-dir` | `FATTERVOICE_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
+| `--manifest` | `FATTERVOICE_PREFETCH_MANIFEST` | empty / unset |
 
 When you pass `--cache-dir`, use the actual Hugging Face hub cache directory that `from_pretrained(...)` will read from. In the Docker image, that path is `/opt/huggingface/hub`.
-
-Prefetch both supported models:
-
-```bash
-uv run fatterqwen-prefetch --model all
-```
 
 If you want runtime to load the exact local snapshot directories directly, also write a manifest during prefetch:
 
 ```bash
-uv run fatterqwen-prefetch \
+uv run fattervoice-prefetch \
   --model all \
   --cache-dir /path/to/huggingface/hub \
   --manifest /path/to/prefetched-models.json
@@ -165,33 +176,20 @@ uv run fatterqwen-prefetch \
 
 ## Docker
 
-The default Docker build uses the same stable CUDA 12.6 wheel flow as the upstream `faster-qwen3-tts` project while running on Ubuntu 24.04 with Python 3.12.
+The default Docker build uses the current CUDA 12.6-based `uv` workflow from this repository while prefetching OmniVoice assets so runtime can stay offline.
 
 Build the image:
 
 ```bash
-docker build -t fatterqwen .
+docker build -t fattervoice .
 ```
 
-By default, the image prefetched **both** supported built-in models (`0.6B` and `1.7B`) during the build, so a finished image can stay offline at runtime while serving either model.
-
-Build a smaller single-model image instead:
+Because the built-in runtime currently targets one primary OmniVoice model alias, both of the following build styles are valid and equivalent for the default backend:
 
 ```bash
-docker build \
-  --build-arg MODEL_SELECTION=0.6B \
-  -t fatterqwen:0.6b .
+docker build --build-arg MODEL_SELECTION=omnivoice -t fattervoice:omnivoice .
+docker build --build-arg MODEL_SELECTION=all -t fattervoice:all .
 ```
-
-Or explicitly build an image that contains both supported models:
-
-```bash
-docker build \
-  --build-arg MODEL_SELECTION=all \
-  -t fatterqwen:all-models .
-```
-
-If you build a single-model offline image, keep the runtime model selection aligned with that build. For example, an image built with `MODEL_SELECTION=0.6B` should run with `FATTERQWEN_MODEL=0.6B` unless you rebuild it with `MODEL_SELECTION=all`.
 
 Run the container:
 
@@ -199,8 +197,8 @@ Run the container:
 docker run --rm --gpus all \
   -p 8000:8000 \
   -p 10300:10300 \
-  -v "$PWD/voices:/opt/fatterqwen/voices:ro" \
-  fatterqwen
+  -v "$PWD/voices:/opt/fattervoice/voices:ro" \
+  fattervoice
 ```
 
 ## Validation
@@ -208,6 +206,6 @@ docker run --rm --gpus all \
 Basic lightweight validation that does not require loading a model:
 
 ```bash
-python -m unittest discover -s tests
-python -m compileall fatterqwen
+uv run python -m unittest discover -s tests
+uv run python -m compileall fattervoice tests
 ```

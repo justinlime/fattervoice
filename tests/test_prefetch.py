@@ -15,7 +15,7 @@ class PrefetchCliTests(unittest.TestCase):
     """Verify that the prefetch module can be executed directly during Docker builds."""
 
     def test_python_module_invocation_runs_prefetch_main_and_writes_manifest(self) -> None:
-        """Ensure `python -m fatterqwen.prefetch` performs the requested work.
+        """Ensure `python -m fattervoice.prefetch` performs the requested work.
 
         Usage:
             The Dockerfile invokes the prefetch helper as a Python module before
@@ -57,7 +57,7 @@ class PrefetchCliTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "fatterqwen.prefetch",
+                    "fattervoice.prefetch",
                     "--model",
                     str(local_model_path),
                     "--manifest",

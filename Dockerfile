@@ -32,42 +32,39 @@ WORKDIR /app
 # Keep the expensive dependency install and model-prefetch layers tied only to
 # dependency metadata and the small prefetch helper surface.
 COPY pyproject.toml uv.lock /app/
-COPY faster-qwen3-tts/pyproject.toml /app/faster-qwen3-tts/pyproject.toml
-COPY faster-qwen3-tts/README.md /app/faster-qwen3-tts/README.md
-COPY faster-qwen3-tts/faster_qwen3_tts /app/faster-qwen3-tts/faster_qwen3_tts
-COPY fatterqwen/__init__.py /app/fatterqwen/__init__.py
-COPY fatterqwen/hf_cache.py /app/fatterqwen/hf_cache.py
-COPY fatterqwen/model_catalog.py /app/fatterqwen/model_catalog.py
-COPY fatterqwen/prefetch.py /app/fatterqwen/prefetch.py
-COPY fatterqwen/prefetch_manifest.py /app/fatterqwen/prefetch_manifest.py
+COPY fattervoice/__init__.py /app/fattervoice/__init__.py
+COPY fattervoice/hf_cache.py /app/fattervoice/hf_cache.py
+COPY fattervoice/model_catalog.py /app/fattervoice/model_catalog.py
+COPY fattervoice/prefetch.py /app/fattervoice/prefetch.py
+COPY fattervoice/prefetch_manifest.py /app/fattervoice/prefetch_manifest.py
 
-RUN uv sync --frozen --extra mp3 --no-install-project
+RUN uv sync --extra mp3 --no-install-project
 
-# Prefetch the selected models during the image build so runtime stays offline.
-RUN mkdir -p /opt/fatterqwen/voices /opt/torchinductor && \
-    uv run --no-sync python -m fatterqwen.prefetch \
+# Prefetch the selected OmniVoice assets during the image build so runtime stays offline.
+RUN mkdir -p /opt/fattervoice/voices /opt/torchinductor && \
+    uv run --no-sync python -m fattervoice.prefetch \
     --model "${MODEL_SELECTION}" \
     --cache-dir "${HF_HUB_CACHE}" \
-    --manifest /opt/fatterqwen/prefetched-models.json
+    --manifest /opt/fattervoice/prefetched-models.json
 
 COPY README.md /app/README.md
-COPY fatterqwen /app/fatterqwen
+COPY fattervoice /app/fattervoice
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
 RUN uv pip install --python /opt/venv/bin/python --no-deps /app && \
     chmod +x /app/docker-entrypoint.sh
 
-ENV FATTERQWEN_VOICES_DIR=/opt/fatterqwen/voices \
-    FATTERQWEN_HOST=0.0.0.0 \
-    FATTERQWEN_PORT=8000 \
-    FATTERQWEN_WYOMING_ENABLED=true \
-    FATTERQWEN_WYOMING_URI=tcp://0.0.0.0:10300 \
-    FATTERQWEN_MODEL_CACHE_DIR=/opt/huggingface/hub \
-    FATTERQWEN_PREFETCH_MANIFEST=/opt/fatterqwen/prefetched-models.json \
+ENV FATTERVOICE_VOICES_DIR=/opt/fattervoice/voices \
+    FATTERVOICE_HOST=0.0.0.0 \
+    FATTERVOICE_PORT=8000 \
+    FATTERVOICE_WYOMING_ENABLED=true \
+    FATTERVOICE_WYOMING_URI=tcp://0.0.0.0:10300 \
+    FATTERVOICE_MODEL_CACHE_DIR=/opt/huggingface/hub \
+    FATTERVOICE_PREFETCH_MANIFEST=/opt/fattervoice/prefetched-models.json \
     MODEL_SELECTION_HINT=${MODEL_SELECTION} \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
 
 EXPOSE 8000 10300
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
-CMD ["fatterqwen"]
+CMD ["fattervoice"]
