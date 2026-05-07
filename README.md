@@ -82,8 +82,6 @@ CLI arguments take precedence, and environment variables act as fallbacks.
 | `--audio-chunk-threshold` | `FATTERVOICE_AUDIO_CHUNK_THRESHOLD` | `30.0` |
 | `--model-cache-dir` | `FATTERVOICE_MODEL_CACHE_DIR`<br>`HF_HUB_CACHE`<br>`HUGGINGFACE_HUB_CACHE`<br>`TRANSFORMERS_CACHE` | empty / unset |
 | `--prefetch-manifest` | `FATTERVOICE_PREFETCH_MANIFEST` | empty / unset |
-| `--warmup` / `--no-warmup` | `FATTERVOICE_WARMUP` | `false` |
-| `--warmup-text` | `FATTERVOICE_WARMUP_TEXT` | `Hello from fattervoice.` |
 | `--wyoming-enabled` / `--no-wyoming-enabled` | `FATTERVOICE_WYOMING_ENABLED` | `true` |
 | `--wyoming-uri` | `FATTERVOICE_WYOMING_URI` | `tcp://0.0.0.0:10300` |
 | `--wyoming-audio-chunk-samples` | `FATTERVOICE_WYOMING_AUDIO_CHUNK_SAMPLES` | `4096` |
@@ -95,7 +93,7 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true, and `
 
 The server is tuned for **fast voice cloning with strong retained quality**:
 
-- voice-clone prompts are precomputed and cached at startup
+- voice-clone prompts are cached lazily on first use, and only the most recently used voice prompt remains cached to keep memory usage predictable
 - `num_step=16` is the default speed-focused OmniVoice setting
 - reference transcripts remain mandatory for stable cloning and offline operation
 - OmniVoice prompt preprocessing and output postprocessing remain enabled by default

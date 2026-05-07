@@ -103,6 +103,31 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(server_config.audio_chunk_duration, 12.0)
         self.assertEqual(server_config.audio_chunk_threshold, 24.0)
 
+    def test_parse_server_config_rejects_removed_warmup_flag(self) -> None:
+        """Ensure the removed warmup flag is no longer accepted by the CLI.
+
+        Usage:
+            Warmup support has been removed entirely, so this regression test
+            verifies that operators receive an argparse failure instead of a
+            silently ignored or partially supported flag.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that argparse raises `SystemExit`.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voices_dir = Path(temp_dir) / "voices"
+            voices_dir.mkdir()
+
+            with self.assertRaises(SystemExit):
+                parse_server_config([
+                    "--voices-dir",
+                    str(voices_dir),
+                    "--warmup",
+                ])
+
 
 if __name__ == "__main__":
     unittest.main()

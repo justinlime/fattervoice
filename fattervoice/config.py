@@ -23,8 +23,6 @@ class ServerConfig:
     max_text_length: int
     model_cache_dir: Optional[Path]
     prefetch_manifest_path: Optional[Path]
-    warmup: bool
-    warmup_text: str
     wyoming_enabled: bool
     wyoming_uri: Optional[str]
     wyoming_audio_chunk_samples: int
@@ -236,17 +234,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Optional JSON manifest that maps prefetched model IDs to exact local snapshot paths.",
     )
     parser.add_argument(
-        "--warmup",
-        action=argparse.BooleanOptionalAction,
-        default=environment_flag("FATTERVOICE_WARMUP", False),
-        help="Run a short warmup generation during startup before traffic arrives.",
-    )
-    parser.add_argument(
-        "--warmup-text",
-        default=environment_default("FATTERVOICE_WARMUP_TEXT", "Hello from fattervoice."),
-        help="Text used when warmup is enabled.",
-    )
-    parser.add_argument(
         "--wyoming-enabled",
         action=argparse.BooleanOptionalAction,
         default=environment_flag("FATTERVOICE_WYOMING_ENABLED", True),
@@ -339,8 +326,6 @@ def parse_server_config(argv: Optional[Sequence[str]] = None) -> ServerConfig:
         max_text_length=args.max_text_length,
         model_cache_dir=model_cache_dir,
         prefetch_manifest_path=prefetch_manifest_path,
-        warmup=args.warmup,
-        warmup_text=args.warmup_text,
         wyoming_enabled=args.wyoming_enabled,
         wyoming_uri=wyoming_uri,
         wyoming_audio_chunk_samples=args.wyoming_audio_chunk_samples,

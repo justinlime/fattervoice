@@ -213,11 +213,13 @@ class TtsService:
         return int(self._require_model().sampling_rate)
 
     async def start(self) -> None:
-        """Load the OmniVoice model, prime voice prompts, and optionally warm it up.
+        """Load the OmniVoice model before either server adapter starts serving.
 
         Usage:
             Call this exactly once during process startup before either server
-            adapter begins accepting requests.
+            adapter begins accepting requests. Voice-clone prompts are built
+            lazily on first use so large voice directories do not eagerly occupy
+            CPU or GPU memory at startup.
 
         Parameters:
             None.
@@ -227,31 +229,6 @@ class TtsService:
         """
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._load_model)
-        await loop.run_in_executor(None, self._prime_voice_clone_prompt_cache)
-        if self.config.warmup:
-            await self.warmup()
-
-    async def warmup(self) -> None:
-        """Run a short synthesis request so prompt caches and kernels are warmed up.
-
-        Usage:
-            This method is optional and is only invoked when startup warmup is
-            enabled. It uses the default voice from the validated voice registry.
-
-        Parameters:
-            None.
-
-        Returns:
-            None. The method completes when the warmup request finishes.
-        """
-        default_voice = self.voice_registry.get(None)
-        LOGGER.info("Running warmup request using voice %s", default_voice.voice_id)
-        await self.synthesize(
-            SynthesisRequest(
-                text=self.config.warmup_text,
-                voice_id=default_voice.voice_id,
-            )
-        )
 
     def validate_request(self, request: SynthesisRequest) -> VoiceEntry:
         """Validate request text and resolve the referenced voice before synthesis.
@@ -277,9 +254,9 @@ class TtsService:
         """Generate a complete waveform for a single synthesis request.
 
         Usage:
-            Non-streaming HTTP responses, Wyoming non-streaming synthesis, and
-            warmup logic use this method when the entire waveform is needed
-            before returning a response.
+            Non-streaming HTTP responses and Wyoming non-streaming synthesis use
+            this method when the entire waveform is needed before returning a
+            response.
 
         Parameters:
             request: A normalized request describing the text, voice, and runtime
@@ -489,26 +466,6 @@ class TtsService:
             raise RuntimeError("The TTS model has not been loaded yet.")
         return self._model
 
-    def _prime_voice_clone_prompt_cache(self) -> None:
-        """Create cached OmniVoice voice-clone prompts for every configured voice.
-
-        Usage:
-            Startup calls this helper once after model load so the first request
-            for each voice does not pay the prompt-tokenization cost. This also
-            fails fast if any voice/transcript pair cannot be converted into an
-            OmniVoice prompt.
-
-        Parameters:
-            None.
-
-        Returns:
-            None. Prompt objects are cached on the service instance.
-        """
-        voice_entries = self.voice_registry.values()
-        LOGGER.info("Priming OmniVoice prompt cache for %d voices", len(voice_entries))
-        for voice in voice_entries:
-            self._resolve_cached_voice_clone_prompt(voice)
-
     def _resolve_cached_voice_clone_prompt(
         self,
         voice: VoiceEntry,
@@ -516,9 +473,11 @@ class TtsService:
         """Create or retrieve the cached OmniVoice prompt for one validated voice.
 
         Usage:
-            Buffered and streaming synthesis both call this helper so every
-            request reuses the same tokenized voice-clone prompt instead of
-            re-processing the original reference audio files.
+            Buffered and streaming synthesis both call this helper so a voice
+            prompt is built lazily on first use and then reused for later
+            requests. To keep memory use predictable, the service retains only
+            the most recently used voice prompt cache entry and discards any
+            previously cached voice when a different voice is requested.
 
         Parameters:
             voice: The validated voice entry selected for the current request.
@@ -532,6 +491,16 @@ class TtsService:
             if cached_voice is not None:
                 return cached_voice
 
+            if self._prepared_voice_cache:
+                evicted_voice_ids = sorted(self._prepared_voice_cache)
+                LOGGER.info(
+                    "Discarding cached OmniVoice prompt entries for %s before caching voice %s",
+                    ", ".join(evicted_voice_ids),
+                    voice.voice_id,
+                )
+                self._prepared_voice_cache.clear()
+
+            LOGGER.info("Creating lazy OmniVoice prompt cache entry for voice %s", voice.voice_id)
             with self._model_lock:
                 prompt = self._require_model().create_voice_clone_prompt(
                     ref_audio=str(voice.audio_path),
@@ -577,8 +546,8 @@ class TtsService:
 
         Usage:
             This helper centralizes the per-call interaction with OmniVoice so
-            the HTTP adapter, Wyoming adapter, and warmup flow all share the same
-            prompt caching and generation-parameter logic.
+            the HTTP adapter and Wyoming adapter both share the same prompt
+            caching and generation-parameter logic.
 
         Parameters:
             request: The normalized request supplying text, language, and speed.

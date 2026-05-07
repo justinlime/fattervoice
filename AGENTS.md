@@ -151,7 +151,7 @@ Relevant OmniVoice options include, when supported by the wrapper:
 - output postprocessing
 - audio chunk duration / threshold
 - model cache path
-- preload / warmup behavior
+- preload / prompt-cache behavior
 - request timeout or max text length
 - Wyoming-specific bind/config options
 

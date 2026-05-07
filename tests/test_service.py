@@ -71,8 +71,9 @@ class FakeVoiceRegistry:
         """Return every configured voice entry in stable voice-ID order.
 
         Usage:
-            Startup prompt priming iterates over this method in production, so
-            tests use it to mirror that behavior.
+            The production registry exposes this method for metadata and any
+            future voice-iteration workflows, so tests provide the same shape
+            even though prompt caching is now lazy by default.
 
         Parameters:
             None.
@@ -176,8 +177,6 @@ def build_test_config(temp_dir: str, **overrides: object) -> ServerConfig:
         "max_text_length": 4000,
         "model_cache_dir": None,
         "prefetch_manifest_path": None,
-        "warmup": False,
-        "warmup_text": "Hello from fattervoice.",
         "wyoming_enabled": True,
         "wyoming_uri": "tcp://0.0.0.0:10300",
         "wyoming_audio_chunk_samples": 4096,
@@ -199,24 +198,27 @@ def build_test_config(temp_dir: str, **overrides: object) -> ServerConfig:
 
 
 
-def build_test_voice_entry(temp_dir: str) -> VoiceEntry:
+def build_test_voice_entry(temp_dir: str, voice_id: str = "demo") -> VoiceEntry:
     """Create one deterministic `VoiceEntry` for service-layer unit tests.
 
     Usage:
-        Tests that do not need the full production scanner still need a realistic
-        voice entry containing public IDs, audio paths, and transcripts.
+        Tests that do not need the full production scanner still need realistic
+        voice entries containing public IDs, audio paths, and transcripts. The
+        optional voice ID parameter lets cache tests model switching between
+        multiple configured voices.
 
     Parameters:
         temp_dir: Temporary directory root used to construct stable fake paths.
+        voice_id: Public voice identifier that should be assigned to the entry.
 
     Returns:
         A `VoiceEntry` object that points at a synthetic voice pair.
     """
     return VoiceEntry(
-        voice_id="demo",
-        audio_path=Path(temp_dir) / "voices" / "demo.wav",
-        transcript_path=Path(temp_dir) / "voices" / "demo.txt",
-        transcript="This is the demo reference transcript.",
+        voice_id=voice_id,
+        audio_path=Path(temp_dir) / "voices" / f"{voice_id}.wav",
+        transcript_path=Path(temp_dir) / "voices" / f"{voice_id}.txt",
+        transcript=f"This is the {voice_id} reference transcript.",
     )
 
 
@@ -356,6 +358,76 @@ class TtsServiceTests(unittest.TestCase):
         self.assertIn("MODEL_SELECTION=all", str(raised_error.exception))
         self.assertIn("omnivoice", str(raised_error.exception))
         self.assertIn("acme/custom-omnivoice", str(raised_error.exception))
+
+    def test_start_defers_prompt_creation_until_a_voice_is_used(self) -> None:
+        """Ensure startup no longer creates cached voice prompts for every voice.
+
+        Usage:
+            Lazy prompt caching is intended to keep large voice directories from
+            consuming memory at startup. This test verifies that `start()` loads
+            or reuses the model without creating any voice-clone prompts before
+            the first synthesis request arrives.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that startup leaves the prompt cache empty.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_model = FakeOmniVoiceModel()
+            service = TtsService(
+                config=build_test_config(temp_dir),
+                voice_registry=FakeVoiceRegistry([build_test_voice_entry(temp_dir)]),
+            )
+            service._model = fake_model
+
+            asyncio.run(service.start())
+
+        self.assertEqual(len(fake_model.created_prompts), 0)
+        self.assertEqual(service._prepared_voice_cache, {})
+
+    def test_synthesize_keeps_only_the_most_recent_voice_prompt_cached(self) -> None:
+        """Ensure the service retains only the last-used voice prompt cache entry.
+
+        Usage:
+            Constraining the cache to one entry keeps VRAM and RAM growth
+            predictable when many voices are configured. This test verifies that
+            switching voices evicts the older cached prompt, and switching back
+            recreates it on demand.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts on cache eviction and prompt recreation.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_model = FakeOmniVoiceModel()
+            service = TtsService(
+                config=build_test_config(temp_dir),
+                voice_registry=FakeVoiceRegistry(
+                    [
+                        build_test_voice_entry(temp_dir, voice_id="demo"),
+                        build_test_voice_entry(temp_dir, voice_id="other"),
+                    ]
+                ),
+            )
+            service._model = fake_model
+
+            async def run_test() -> None:
+                await service.synthesize(SynthesisRequest(text="First", voice_id="demo"))
+                await service.synthesize(SynthesisRequest(text="Second", voice_id="other"))
+                await service.synthesize(SynthesisRequest(text="Third", voice_id="demo"))
+
+            asyncio.run(run_test())
+
+        self.assertEqual(len(fake_model.created_prompts), 3)
+        self.assertEqual(
+            [Path(prompt["ref_audio"]).stem for prompt in fake_model.created_prompts],
+            ["demo", "other", "demo"],
+        )
+        self.assertEqual(sorted(service._prepared_voice_cache), ["demo"])
 
     def test_synthesize_reuses_cached_voice_prompt_and_normalizes_language(self) -> None:
         """Ensure repeated synthesis requests reuse one cached OmniVoice prompt.

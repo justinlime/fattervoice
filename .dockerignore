@@ -7,3 +7,4 @@
 !uv.lock
 !fattervoice/
 !fattervoice/**
+!__pycache__/
