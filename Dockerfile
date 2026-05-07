@@ -20,11 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     ffmpeg \
-    git \
     libsndfile1 \
     python3 \
     python3-venv \
-    sox \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -36,19 +34,22 @@ COPY fattervoice/__init__.py /app/fattervoice/__init__.py
 COPY fattervoice/model_catalog.py /app/fattervoice/model_catalog.py
 COPY fattervoice/prefetch.py /app/fattervoice/prefetch.py
 
-RUN uv sync --extra mp3 --no-install-project
+RUN uv sync --extra mp3 --no-install-project && \
+    rm -rf /root/.cache/uv
 
 # Prefetch the selected OmniVoice assets during the image build so runtime stays offline.
 RUN mkdir -p /opt/fattervoice/voices /opt/torchinductor && \
     uv run --no-sync python -m fattervoice.prefetch \
-    --model "${MODEL_SELECTION}"
+    --model "${MODEL_SELECTION}" && \
+    rm -rf /root/.cache/uv
 
 COPY README.md /app/README.md
 COPY fattervoice /app/fattervoice
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
 RUN uv pip install --python /opt/venv/bin/python --no-deps /app && \
-    chmod +x /app/docker-entrypoint.sh
+    chmod +x /app/docker-entrypoint.sh && \
+    rm -rf /root/.cache/uv
 
 ENV FATTERVOICE_VOICES_DIR=/opt/fattervoice/voices \
     FATTERVOICE_OPENAPI_HOST=0.0.0.0 \
