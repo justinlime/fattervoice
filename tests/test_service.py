@@ -193,27 +193,40 @@ def build_test_config(temp_dir: str, **overrides: object) -> ServerConfig:
 
 
 
-def build_test_voice_entry(temp_dir: str, voice_id: str = "demo") -> VoiceEntry:
+def build_test_voice_entry(
+    temp_dir: str,
+    voice_id: str = "demo",
+    instruct: str | None = None,
+) -> VoiceEntry:
     """Create one deterministic `VoiceEntry` for service-layer unit tests.
 
     Usage:
         Tests that do not need the full production scanner still need realistic
-        voice entries containing public IDs, audio paths, and transcripts. The
-        optional voice ID parameter lets cache tests model switching between
-        multiple configured voices.
+        voice entries containing public IDs, audio paths, reference transcripts,
+        and optional instruct text. The optional voice ID parameter lets cache
+        tests model switching between multiple configured voices.
 
     Parameters:
         temp_dir: Temporary directory root used to construct stable fake paths.
         voice_id: Public voice identifier that should be assigned to the entry.
+        instruct: Optional OmniVoice instruct text that should be attached to
+            the entry as if it came from `<voice>.instruct.txt`.
 
     Returns:
         A `VoiceEntry` object that points at a synthetic voice pair.
     """
+    instruct_path = (
+        Path(temp_dir) / "voices" / f"{voice_id}.instruct.txt"
+        if instruct is not None
+        else None
+    )
     return VoiceEntry(
         voice_id=voice_id,
         audio_path=Path(temp_dir) / "voices" / f"{voice_id}.wav",
-        transcript_path=Path(temp_dir) / "voices" / f"{voice_id}.txt",
+        transcript_path=Path(temp_dir) / "voices" / f"{voice_id}.ref.txt",
         transcript=f"This is the {voice_id} reference transcript.",
+        instruct_path=instruct_path,
+        instruct=instruct,
     )
 
 
@@ -501,6 +514,45 @@ class TtsServiceTests(unittest.TestCase):
         self.assertEqual(
             fake_model.generated_requests[0]["voice_clone_prompt"],
             fake_model.generated_requests[1]["voice_clone_prompt"],
+        )
+
+    def test_synthesize_forwards_optional_voice_instruct_text(self) -> None:
+        """Ensure generation forwards per-voice instruct text when configured.
+
+        Usage:
+            Voices may now include optional `<voice>.instruct.txt` files for
+            OmniVoice voice-design guidance. This test verifies that the shared
+            synthesis service automatically forwards that text to
+            `OmniVoice.generate(...)` when the selected voice includes it.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that the generated OmniVoice kwargs include
+            the configured instruct string for the selected voice.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_model = FakeOmniVoiceModel()
+            service = TtsService(
+                config=build_test_config(temp_dir),
+                voice_registry=FakeVoiceRegistry(
+                    [
+                        build_test_voice_entry(
+                            temp_dir,
+                            voice_id="demo",
+                            instruct="female, british accent, whisper",
+                        )
+                    ]
+                ),
+            )
+            service._model = fake_model
+
+            asyncio.run(service.synthesize(SynthesisRequest(text="Hello there", voice_id="demo")))
+
+        self.assertEqual(
+            fake_model.generated_requests[0]["instruct"],
+            "female, british accent, whisper",
         )
 
     def test_synthesize_releases_unused_accelerator_memory_when_switching_voices(self) -> None:

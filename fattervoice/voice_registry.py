@@ -8,6 +8,8 @@ from typing import Dict, Iterable, Optional
 import wave
 
 _AUDIO_SUFFIXES = {".aif", ".aiff", ".au", ".flac", ".ogg", ".wav"}
+_REFERENCE_TRANSCRIPT_SUFFIX = ".ref.txt"
+_INSTRUCT_TEXT_SUFFIX = ".instruct.txt"
 
 
 class VoiceRegistryError(ValueError):
@@ -22,10 +24,63 @@ class VoiceEntry:
     audio_path: Path
     transcript_path: Path
     transcript: str
+    instruct_path: Path | None = None
+    instruct: str | None = None
+
+
+
+def parse_voice_text_metadata_path(metadata_path: Path) -> tuple[str, str] | None:
+    """Classify a voice text file as required transcript or optional instruct metadata.
+
+    Usage:
+        Voice-registry scanning calls this helper for every discovered text file
+        so compound suffixes like `.ref.txt` and `.instruct.txt` are parsed
+        consistently without relying on `Path.stem`, which would otherwise drop
+        only the final `.txt` suffix.
+
+    Parameters:
+        metadata_path: The file path that should be inspected.
+
+    Returns:
+        A `(voice_id, metadata_kind)` tuple when the file matches a supported
+        voice text-metadata suffix, otherwise `None`.
+    """
+    filename = metadata_path.name
+    for suffix, metadata_kind in (
+        (_REFERENCE_TRANSCRIPT_SUFFIX, "transcript"),
+        (_INSTRUCT_TEXT_SUFFIX, "instruct"),
+    ):
+        if filename.endswith(suffix):
+            voice_id = filename[: -len(suffix)]
+            return (voice_id, metadata_kind) if voice_id else None
+    return None
+
+
+
+def read_optional_instruct_text(instruct_path: Path | None) -> str | None:
+    """Load optional per-voice OmniVoice instruct text from disk when present.
+
+    Usage:
+        Voice-registry scanning uses this helper after file pairing so optional
+        `.instruct.txt` files can be normalized once at startup and then reused
+        for every request that selects the associated voice.
+
+    Parameters:
+        instruct_path: The optional instruct-text file path paired with a voice.
+
+    Returns:
+        The stripped instruct string when a non-empty file exists, otherwise
+        `None` when no instruct file is configured or the file is blank.
+    """
+    if instruct_path is None:
+        return None
+
+    normalized_instruct = instruct_path.read_text(encoding="utf-8").strip()
+    return normalized_instruct or None
 
 
 class VoiceRegistry:
-    """Validated mapping from public voice IDs to reference audio/transcript pairs."""
+    """Validated mapping from public voice IDs to reference voice assets."""
 
     def __init__(self, voices_dir: Path, entries: Iterable[VoiceEntry]) -> None:
         """Create an in-memory registry from already validated voice entries.
@@ -58,11 +113,11 @@ class VoiceRegistry:
 
         Usage:
             Call this during startup so the server can fail fast on missing
-            transcripts, duplicate basenames, unsupported layouts, or unreadable
-            reference audio files.
+            `.ref.txt` transcripts, duplicate basenames, stray metadata files,
+            unsupported layouts, or unreadable reference audio files.
 
         Parameters:
-            voices_dir: The directory containing reference audio and transcript files.
+            voices_dir: The directory containing reference audio plus paired text files.
 
         Returns:
             A ready-to-use `VoiceRegistry` containing all discovered voices.
@@ -77,17 +132,33 @@ class VoiceRegistry:
 
         audio_files: Dict[str, Path] = {}
         transcript_files: Dict[str, Path] = {}
+        instruct_files: Dict[str, Path] = {}
 
         for child_path in sorted(voices_dir.iterdir()):
             if not child_path.is_file():
                 continue
 
-            suffix = child_path.suffix.lower()
-            voice_id = child_path.stem
-            if suffix == ".txt":
-                transcript_files[voice_id] = child_path
+            metadata_match = parse_voice_text_metadata_path(child_path)
+            if metadata_match is not None:
+                voice_id, metadata_kind = metadata_match
+                if metadata_kind == "transcript":
+                    if voice_id in transcript_files:
+                        raise VoiceRegistryError(
+                            "Duplicate reference transcript files found for voice "
+                            f"{voice_id!r}: {transcript_files[voice_id].name} and {child_path.name}."
+                        )
+                    transcript_files[voice_id] = child_path
+                else:
+                    if voice_id in instruct_files:
+                        raise VoiceRegistryError(
+                            "Duplicate instruct text files found for voice "
+                            f"{voice_id!r}: {instruct_files[voice_id].name} and {child_path.name}."
+                        )
+                    instruct_files[voice_id] = child_path
                 continue
 
+            suffix = child_path.suffix.lower()
+            voice_id = child_path.stem
             if suffix not in _AUDIO_SUFFIXES:
                 continue
 
@@ -107,15 +178,31 @@ class VoiceRegistry:
         missing_transcripts = sorted(set(audio_files) - set(transcript_files))
         if missing_transcripts:
             raise VoiceRegistryError(
-                "Missing transcript files for voices: "
-                + ", ".join(f"{voice_id}.txt" for voice_id in missing_transcripts)
+                "Missing reference transcript files for voices: "
+                + ", ".join(
+                    f"{voice_id}{_REFERENCE_TRANSCRIPT_SUFFIX}"
+                    for voice_id in missing_transcripts
+                )
             )
 
         stray_transcripts = sorted(set(transcript_files) - set(audio_files))
         if stray_transcripts:
             raise VoiceRegistryError(
-                "Transcript files without matching audio were found for voices: "
-                + ", ".join(stray_transcripts)
+                "Reference transcript files without matching audio were found for voices: "
+                + ", ".join(
+                    f"{voice_id}{_REFERENCE_TRANSCRIPT_SUFFIX}"
+                    for voice_id in stray_transcripts
+                )
+            )
+
+        stray_instructs = sorted(set(instruct_files) - set(audio_files))
+        if stray_instructs:
+            raise VoiceRegistryError(
+                "Instruct text files without matching audio were found for voices: "
+                + ", ".join(
+                    f"{voice_id}{_INSTRUCT_TEXT_SUFFIX}"
+                    for voice_id in stray_instructs
+                )
             )
 
         entries = []
@@ -124,8 +211,11 @@ class VoiceRegistry:
             transcript = transcript_path.read_text(encoding="utf-8").strip()
             if not transcript:
                 raise VoiceRegistryError(
-                    f"Transcript file is empty for voice {voice_id!r}: {transcript_path}"
+                    f"Reference transcript file is empty for voice {voice_id!r}: {transcript_path}"
                 )
+
+            instruct_path = instruct_files.get(voice_id)
+            instruct = read_optional_instruct_text(instruct_path)
 
             validate_audio_file(audio_path)
             entries.append(
@@ -134,6 +224,8 @@ class VoiceRegistry:
                     audio_path=audio_path,
                     transcript_path=transcript_path,
                     transcript=transcript,
+                    instruct_path=instruct_path,
+                    instruct=instruct,
                 )
             )
 

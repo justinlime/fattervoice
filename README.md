@@ -8,7 +8,7 @@ The repository name is historical, but the runtime backend is now fully OmniVoic
 - chunked WAV/PCM HTTP responses
 - Wyoming protocol support for Home Assistant
 - streamed Wyoming text-input handling with emitted audio chunks
-- a validated `voices/` directory registry based on `<voice>.<audio>` + `<voice>.txt`
+- a validated `voices/` directory registry based on `<voice>.<audio>` + required `<voice>.ref.txt` plus optional `<voice>.instruct.txt`
 - `uv`-based project management and Docker builds
 - offline-oriented model prefetch for Docker/runtime use
 
@@ -23,18 +23,22 @@ The repository name is historical, but the runtime backend is now fully OmniVoic
 Each voice must have exactly:
 
 - one supported reference audio file
-- one matching transcript text file
+- one matching reference transcript text file named `<voice>.ref.txt`
+- optionally, one instruct text file named `<voice>.instruct.txt`
 
 Examples:
 
 - `voices/hank.wav`
-- `voices/hank.txt`
+- `voices/hank.ref.txt`
+- `voices/hank.instruct.txt` *(optional)*
 - `voices/jane.flac`
-- `voices/jane.txt`
+- `voices/jane.ref.txt`
 
 The basename becomes the public `voice` identifier exposed through both the OpenAI-compatible API and Wyoming.
 
-Because `fattervoice` requires transcripts for every voice, OmniVoice auto-ASR is intentionally **not** part of the normal server flow. This keeps voice cloning faster, more stable, and easier to run offline.
+When `<voice>.instruct.txt` is present, its stripped text is forwarded to OmniVoice as the per-voice `instruct` string for voice-design/style guidance. When it is absent, synthesis behaves the same as before.
+
+Because `fattervoice` requires reference transcripts for every voice, OmniVoice auto-ASR is intentionally **not** part of the normal server flow. This keeps voice cloning faster, more stable, and easier to run offline.
 
 ## Local development with `uv`
 

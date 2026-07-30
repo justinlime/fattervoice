@@ -122,7 +122,7 @@ if WYOMING_IMPORT_ERROR is None:
             self.addCleanup(temporary_directory.cleanup)
             voices_dir = Path(temporary_directory.name)
             audio_path = voices_dir / "hank.wav"
-            transcript_path = voices_dir / "hank.txt"
+            transcript_path = voices_dir / "hank.ref.txt"
 
             with wave.open(str(audio_path), "wb") as wav_file:
                 wav_file.setnchannels(1)

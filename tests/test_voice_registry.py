@@ -34,35 +34,72 @@ def write_test_wav(path: Path) -> None:
 class VoiceRegistryTests(unittest.TestCase):
     """Verify that the registry enforces the basename-paired voice directory contract."""
 
-    def test_scan_valid_voice_directory(self) -> None:
-        """Ensure a complete audio/transcript pair becomes a discoverable voice entry.
+    def test_scan_valid_voice_directory_without_instruct_file(self) -> None:
+        """Ensure a required audio/ref-transcript pair still works without instruct text.
 
         Usage:
-            This test protects the happy path that server startup depends on when
-            it scans the configured `voices/` directory.
+            This test protects the backward-compatible happy path where a voice
+            provides the required audio plus `.ref.txt` transcript but omits the
+            optional `.instruct.txt` companion.
 
         Parameters:
             None.
 
         Returns:
-            None. The test asserts that the registry exposes the expected voice ID.
+            None. The test asserts that the registry exposes the expected voice
+            ID and leaves the optional instruct fields unset.
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             voices_dir = Path(temp_dir)
             write_test_wav(voices_dir / "hank.wav")
-            (voices_dir / "hank.txt").write_text("Reference transcript.", encoding="utf-8")
+            (voices_dir / "hank.ref.txt").write_text("Reference transcript.", encoding="utf-8")
 
             registry = VoiceRegistry.scan(voices_dir)
+            voice_entry = registry.get("hank")
 
             self.assertEqual(registry.default_voice_id, "hank")
-            self.assertEqual(registry.get("hank").transcript, "Reference transcript.")
+            self.assertEqual(voice_entry.transcript, "Reference transcript.")
+            self.assertIsNone(voice_entry.instruct_path)
+            self.assertIsNone(voice_entry.instruct)
 
-    def test_scan_rejects_missing_transcript(self) -> None:
-        """Ensure startup validation fails when an audio file lacks a matching transcript.
+    def test_scan_preserves_optional_instruct_text_when_present(self) -> None:
+        """Ensure optional instruct metadata is loaded and attached to the voice.
+
+        Usage:
+            OmniVoice voice design uses an optional `instruct` string, so this
+            test verifies that `<voice>.instruct.txt` is discovered at startup
+            and stored on the resulting `VoiceEntry` for later synthesis calls.
+
+        Parameters:
+            None.
+
+        Returns:
+            None. The test asserts that the registry exposes the instruct path
+            and stripped instruct text for the selected voice.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            voices_dir = Path(temp_dir)
+            write_test_wav(voices_dir / "hank.wav")
+            (voices_dir / "hank.ref.txt").write_text("Reference transcript.", encoding="utf-8")
+            (voices_dir / "hank.instruct.txt").write_text(
+                " female, british accent, whisper \n",
+                encoding="utf-8",
+            )
+
+            registry = VoiceRegistry.scan(voices_dir)
+            voice_entry = registry.get("hank")
+
+            self.assertEqual(voice_entry.transcript_path.name, "hank.ref.txt")
+            self.assertEqual(voice_entry.instruct_path.name, "hank.instruct.txt")
+            self.assertEqual(voice_entry.instruct, "female, british accent, whisper")
+
+    def test_scan_rejects_missing_reference_transcript(self) -> None:
+        """Ensure startup validation fails when an audio file lacks a matching `.ref.txt`.
 
         Usage:
             This test protects the project's voice-cloning quality contract that
-            every voice must provide a transcript.
+            every voice must provide a reference transcript file using the new
+            `.ref.txt` naming convention.
 
         Parameters:
             None.
@@ -94,7 +131,7 @@ class VoiceRegistryTests(unittest.TestCase):
             voices_dir = Path(temp_dir)
             write_test_wav(voices_dir / "hank.wav")
             write_test_wav(voices_dir / "hank.aiff")
-            (voices_dir / "hank.txt").write_text("Reference transcript.", encoding="utf-8")
+            (voices_dir / "hank.ref.txt").write_text("Reference transcript.", encoding="utf-8")
 
             with self.assertRaises(VoiceRegistryError):
                 VoiceRegistry.scan(voices_dir)

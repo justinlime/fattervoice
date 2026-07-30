@@ -625,7 +625,7 @@ class TtsService:
             WAV/PCM encoding.
         """
         cached_voice = self._resolve_cached_voice_clone_prompt(voice)
-        generation_kwargs = self._build_generation_kwargs(request, cached_voice)
+        generation_kwargs = self._build_generation_kwargs(request, voice, cached_voice)
         with self._model_lock:
             if (
                 self._last_generated_voice_id is not None
@@ -644,17 +644,21 @@ class TtsService:
     def _build_generation_kwargs(
         self,
         request: SynthesisRequest,
+        voice: VoiceEntry,
         cached_voice: CachedVoiceClonePrompt,
     ) -> dict[str, object]:
         """Build the OmniVoice keyword arguments for one synthesis call.
 
         Usage:
             Internal generation methods call this helper so every request uses
-            the same cached voice-clone prompt and the same server-level OmniVoice
-            tuning defaults unless a client overrides request-level speed.
+            the same cached voice-clone prompt, the selected voice's optional
+            instruct text, and the same server-level OmniVoice tuning defaults
+            unless a client overrides request-level speed.
 
         Parameters:
             request: The normalized request supplying text, language, and speed.
+            voice: The validated voice entry selected for this request, including
+                any optional instruct text loaded from `<voice>.instruct.txt`.
             cached_voice: The tokenized OmniVoice voice-clone prompt selected for
                 this request.
 
@@ -679,6 +683,8 @@ class TtsService:
             "audio_chunk_duration": self.config.audio_chunk_duration,
             "audio_chunk_threshold": self.config.audio_chunk_threshold,
         }
+        if voice.instruct is not None:
+            generation_kwargs["instruct"] = voice.instruct
         if request.speed is not None:
             generation_kwargs["speed"] = request.speed
         return generation_kwargs
