@@ -576,6 +576,7 @@ class TtsService:
 
             cpu_prompt = move_prompt_value_to_cpu(prompt)
             del prompt
+            self._release_unused_accelerator_memory()
             cached_voice = CachedVoiceClonePrompt(
                 voice_id=voice.voice_id,
                 prompt=cpu_prompt,
@@ -639,6 +640,7 @@ class TtsService:
         waveform = audio_list[0] if audio_list else np.zeros(0, dtype=np.float32)
         normalized_waveform = coerce_waveform_array(waveform)
         del audio_list
+        self._release_unused_accelerator_memory()
         return normalized_waveform, self.sample_rate
 
     def _build_generation_kwargs(
