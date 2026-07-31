@@ -172,34 +172,93 @@ def coerce_waveform_array(waveform: Any) -> np.ndarray:
 
 
 
-def split_text_for_streaming(text: str) -> list[str]:
-    """Split synthesized text into sentence-first streaming segments.
+def split_text_for_streaming(text: str, max_length: int = 400) -> list[str]:
+    """Split request text into sentence-first synthesis segments with a length cap.
 
     Usage:
         OmniVoice currently exposes buffered generation rather than a documented
-        model-incremental audio streaming API. When clients explicitly request a
-        low-latency stream, the wrapper can still reduce time-to-first-audio by
-        synthesizing one sentence-like segment at a time. This helper centralizes
-        that segmentation logic and preserves the final trailing fragment when no
-        closing punctuation is present.
+        model-incremental audio streaming API. The wrapper splits text into
+        sentence-like segments so each synthesis call stays bounded in memory
+        and time. Any single segment that exceeds ``max_length`` characters is
+        broken further on word boundaries to prevent runaway resource usage.
 
     Parameters:
         text: The already-validated request text that should be segmented.
+        max_length: Maximum character count for any single segment. Sentence
+            boundaries are respected first; only oversized segments are split
+            further on spaces.
 
     Returns:
         A non-empty ordered list of stripped text segments suitable for
         sequential synthesis.
     """
     sentence_detector = SentenceBoundaryDetector()
-    streaming_segments = [
+    raw_segments = [
         segment.strip()
         for segment in sentence_detector.add_chunk(text)
         if segment.strip()
     ]
     trailing_segment = sentence_detector.finish().strip()
     if trailing_segment:
-        streaming_segments.append(trailing_segment)
-    return streaming_segments or [text.strip()]
+        raw_segments.append(trailing_segment)
+
+    if not raw_segments:
+        return [text.strip()]
+
+    capped: list[str] = []
+    for segment in raw_segments:
+        if len(segment) <= max_length:
+            capped.append(segment)
+        else:
+            capped.extend(_split_segment_on_words(segment, max_length))
+    return capped
+
+
+def _split_segment_on_words(segment: str, max_length: int) -> list[str]:
+    """Break an oversized segment into smaller chunks on word boundaries.
+
+    Usage:
+        ``split_text_for_streaming`` calls this helper when a single sentence
+        exceeds the configured character cap so it can still be synthesized
+        in manageable pieces without breaking words mid-character.
+
+    Parameters:
+        segment: A stripped text segment that is longer than ``max_length``.
+        max_length: The maximum character count for each produced chunk.
+
+    Returns:
+        An ordered list of stripped sub-segments, each at most ``max_length``
+        characters long.
+    """
+    words = segment.split()
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for word in words:
+        word_len = len(word)
+        # If a single word exceeds the cap, force-split it
+        if word_len > max_length:
+            if current:
+                chunks.append(" ".join(current))
+                current = []
+                current_len = 0
+            # Hard-split the oversized word
+            for i in range(0, word_len, max_length):
+                chunks.append(word[i : i + max_length])
+            continue
+
+        if current_len + (1 if current else 0) + word_len > max_length:
+            chunks.append(" ".join(current))
+            current = [word]
+            current_len = word_len
+        else:
+            current.append(word)
+            current_len += (1 if len(current) > 1 else 0) + word_len
+
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
 
 
 class TtsService:
@@ -324,7 +383,8 @@ class TtsService:
         Usage:
             Non-streaming HTTP responses and Wyoming non-streaming synthesis use
             this method when the entire waveform is needed before returning a
-            response.
+            response. The text is split into sentence-sized segments internally
+            so no single OmniVoice call exceeds the configured segment cap.
 
         Parameters:
             request: A normalized request describing the text, voice, and runtime
@@ -332,20 +392,84 @@ class TtsService:
 
         Returns:
             A tuple of `(waveform, sample_rate)` where the waveform is a mono
-            float32 NumPy array.
+            float32 NumPy array containing all synthesized segments concatenated.
         """
         voice = self.validate_request(request)
+        segments = split_text_for_streaming(request.text, self.config.max_sentence_length)
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: self._generate_waveform(request, voice))
+        waveforms: list[np.ndarray] = []
+        for i, segment_text in enumerate(segments):
+            seg_request = SynthesisRequest(
+                text=segment_text,
+                voice_id=voice.voice_id,
+                language=request.language,
+                speed=request.speed,
+            )
+            waveform, _ = await loop.run_in_executor(
+                None, lambda sr=seg_request, v=voice: self._generate_waveform(sr, v)
+            )
+            waveforms.append(waveform)
+        combined = np.concatenate(waveforms) if waveforms else np.array([], dtype=np.float32)
+        return combined, self.sample_rate
 
     def stream_pcm_chunks(self, request: SynthesisRequest) -> AsyncIterator[bytes]:
-        """Yield PCM chunks for a request after one buffered OmniVoice generation.
+        """Yield PCM chunks by synthesizing sentence-sized segments sequentially.
 
         Usage:
-            This method preserves the highest-quality whole-request synthesis path
-            while still exposing chunked WAV/PCM transport. It validates eagerly,
-            runs one full OmniVoice generation in the background, and then chunks
-            the resulting PCM bytes for HTTP or Wyoming delivery.
+            All streaming paths (HTTP and Wyoming) use this method. It splits
+            validated text into sentence-like segments, synthesizes them one at
+            a time, and emits PCM bytes as each segment completes.
+
+        Parameters:
+            request: A normalized request describing the text, voice, and runtime
+                options for the generation.
+
+        Returns:
+            An async iterator that yields raw 16-bit PCM audio chunks as each
+            synthesis segment completes.
+        """
+        resolved_voice = self.validate_request(request)
+        segments = split_text_for_streaming(request.text, self.config.max_sentence_length)
+
+        async def emit_pcm_chunks() -> AsyncIterator[bytes]:
+            """Synthesize segments sequentially and yield PCM chunks.
+
+            Usage:
+                The outer method performs eager validation and segment planning
+                so this nested generator focuses on sequential synthesis and
+                byte emission once the response body has started.
+
+            Parameters:
+                None. It closes over the validated request state.
+
+            Returns:
+                An async iterator that yields fixed-size PCM byte chunks.
+            """
+            loop = asyncio.get_running_loop()
+            for segment_text in segments:
+                seg_request = SynthesisRequest(
+                    text=segment_text,
+                    voice_id=resolved_voice.voice_id,
+                    language=request.language,
+                    speed=request.speed,
+                )
+                waveform, _ = await loop.run_in_executor(
+                    None,
+                    lambda sr=seg_request, v=resolved_voice: self._generate_waveform(sr, v),
+                )
+                pcm_payload = audio_to_pcm16_bytes(waveform)
+                for pcm_chunk in iter_byte_chunks(pcm_payload, _STREAMING_PCM_CHUNK_BYTES):
+                    yield pcm_chunk
+
+        return emit_pcm_chunks()
+
+    def stream_low_latency_pcm_chunks(self, request: SynthesisRequest) -> AsyncIterator[bytes]:
+        """Alias for ``stream_pcm_chunks`` — all paths now use sentence-based splitting.
+
+        Usage:
+            The HTTP adapter still calls this name for explicit ``stream=true``
+            requests, but the underlying behavior is identical to the default
+            streaming path.
 
         Parameters:
             request: A normalized request describing the text, voice, and runtime
@@ -354,50 +478,7 @@ class TtsService:
         Returns:
             An async iterator that yields raw 16-bit PCM audio chunks.
         """
-        self.validate_request(request)
-
-        async def emit_buffered_pcm_chunks() -> AsyncIterator[bytes]:
-            """Generate one waveform asynchronously and yield it as PCM chunks.
-
-            Usage:
-                The outer method performs eager validation so HTTP/Wyoming can
-                still return normal client errors before any bytes are sent, while
-                this nested generator handles the deferred full-audio generation.
-
-            Parameters:
-                None. It closes over the validated request state.
-
-            Returns:
-                An async iterator that yields fixed-size PCM byte chunks.
-            """
-            waveform, sample_rate = await self.synthesize(request)
-            _ = sample_rate
-            pcm_payload = audio_to_pcm16_bytes(waveform)
-            for pcm_chunk in iter_byte_chunks(pcm_payload, _STREAMING_PCM_CHUNK_BYTES):
-                yield pcm_chunk
-
-        return emit_buffered_pcm_chunks()
-
-    def stream_low_latency_pcm_chunks(self, request: SynthesisRequest) -> AsyncIterator[bytes]:
-        """Yield PCM chunks using sentence-sized sequential synthesis for lower TTFA.
-
-        Usage:
-            OmniVoice does not currently expose a documented true incremental
-            audio streaming API. This method approximates lower-latency streaming
-            for explicit `stream=true` HTTP requests by splitting validated text
-            into sentence-like segments, synthesizing them one at a time with the
-            cached voice-clone prompt, and emitting PCM as each segment finishes.
-            Whole-request buffered synthesis remains available through
-            `stream_pcm_chunks(...)` for quality-first paths.
-
-        Parameters:
-            request: A normalized request describing the text, voice, and runtime
-                options for the generation.
-
-        Returns:
-            An async iterator that yields raw 16-bit PCM audio chunks as each
-            sentence-sized synthesis segment completes.
-        """
+        return self.stream_pcm_chunks(request)
         resolved_voice = self.validate_request(request)
         streaming_segments = split_text_for_streaming(request.text)
 
@@ -692,8 +773,6 @@ class TtsService:
             "class_temperature": self.config.class_temperature,
             "layer_penalty_factor": self.config.layer_penalty_factor,
             "postprocess_output": self.config.postprocess_output_audio,
-            "audio_chunk_duration": self.config.audio_chunk_duration,
-            "audio_chunk_threshold": self.config.audio_chunk_threshold,
         }
         if voice.instruct is not None:
             generation_kwargs["instruct"] = voice.instruct

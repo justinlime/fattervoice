@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import time
+from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, StreamingResponse
@@ -15,6 +16,73 @@ from .service import SynthesisRequest, TtsService
 from .voice_registry import VoiceRegistry, VoiceRegistryError
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _format_elapsed(secs: float) -> str:
+    """Format elapsed seconds into a human-readable string.
+
+    Returns seconds with 3 decimal places for sub-minute values, or minutes
+    and seconds for longer durations.
+    """
+    if secs < 60:
+        return f"{secs:.3f}s"
+    minutes = int(secs // 60)
+    remaining = secs % 60
+    return f"{minutes}m {remaining:.3f}s"
+
+
+def _format_rtf(audio_seconds: float, wall_seconds: float) -> str:
+    """Format Real-Time Factor with a human-readable speed clarification.
+
+    RTF = audio_duration / wall_clock_time.
+    - RTF < 1.0 means faster than real time (e.g. 0.5 = 2x real-time speed)
+    - RTF == 1.0 means exactly real time
+    - RTF > 1.0 means slower than real time (e.g. 2.0 = 0.5x real-time speed)
+    """
+    if wall_seconds <= 0:
+        return "RTF: N/A (no wall time)"
+    rtf = audio_seconds / wall_seconds
+    if rtf < 1.0:
+        speed = 1.0 / rtf
+        return f"RTF: {rtf:.3f} ({speed:.1f}x real-time speed)"
+    elif rtf > 1.0:
+        speed = 1.0 / rtf
+        return f"RTF: {rtf:.3f} ({speed:.2f}x real-time speed)"
+    return f"RTF: {rtf:.3f} (1.0x real-time speed)"
+
+
+async def _wrap_stream_with_timing(
+    chunk_stream: AsyncIterator[bytes],
+    request_start: float,
+    log_prefix: str,
+    sample_rate: int,
+) -> AsyncIterator[bytes]:
+    """Wrap an async byte stream and log first/last chunk timing plus RTF.
+
+    Yields every chunk from ``chunk_stream`` unchanged while logging:
+    - elapsed time when the first chunk is sent to the client
+    - elapsed time when the last chunk is sent to the client
+    - Real-Time Factor after the stream is exhausted
+
+    Returns (via non-local mutation) total PCM bytes through ``_stream_metrics``.
+    """
+    first = True
+    last_chunk_time: float | None = None
+    total_pcm_bytes = 0
+
+    async for chunk in chunk_stream:
+        if first:
+            elapsed = time.monotonic() - request_start
+            LOGGER.info("%s first chunk sent to client (%s)", log_prefix, _format_elapsed(elapsed))
+            first = False
+        total_pcm_bytes += len(chunk)
+        last_chunk_time = time.monotonic()
+        yield chunk
+
+    if last_chunk_time is not None:
+        wall_seconds = last_chunk_time - request_start
+        audio_seconds = total_pcm_bytes / (2 * sample_rate)  # 16-bit mono PCM
+        LOGGER.info("%s last chunk sent to client (%s) %s", log_prefix, _format_elapsed(wall_seconds), _format_rtf(audio_seconds, wall_seconds))
 
 
 class SpeechRequest(BaseModel):
@@ -160,6 +228,9 @@ def create_openai_app(service: TtsService, voice_registry: VoiceRegistry, config
             speed=request.speed,
         )
 
+        voice_label = synthesis_request.voice_id or "default"
+        LOGGER.info("OpenAI generation request received (voice=%s, format=%s, stream=%s)", voice_label, response_format, stream_response if request.stream is not None else "auto")
+
         stream_response = (
             response_format in {"wav", "pcm"}
             if request.stream is None
@@ -178,6 +249,9 @@ def create_openai_app(service: TtsService, voice_registry: VoiceRegistry, config
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+            request_start = time.monotonic()
+            log_prefix = f"OpenAI stream (voice={voice_label}, format={response_format})"
 
             async def streamed_audio_body():
                 """Yield a streaming HTTP audio body using the shared synthesis service.
@@ -199,7 +273,9 @@ def create_openai_app(service: TtsService, voice_registry: VoiceRegistry, config
                 try:
                     if response_format == "wav":
                         yield build_wav_header(service.sample_rate)
-                    async for pcm_chunk in pcm_chunk_stream:
+                    async for pcm_chunk in _wrap_stream_with_timing(
+                        pcm_chunk_stream, request_start, log_prefix, service.sample_rate,
+                    ):
                         yield pcm_chunk
                 except Exception:  # pragma: no cover - exercised during runtime integration.
                     LOGGER.exception("Unhandled streaming synthesis failure")
@@ -210,6 +286,7 @@ def create_openai_app(service: TtsService, voice_registry: VoiceRegistry, config
                 media_type=content_types[response_format],
             )
 
+        request_start = time.monotonic()
         try:
             waveform, sample_rate = await service.synthesize(synthesis_request)
             if response_format == "wav":
@@ -227,6 +304,10 @@ def create_openai_app(service: TtsService, voice_registry: VoiceRegistry, config
         except Exception as exc:  # pragma: no cover - exercised in runtime integration.
             LOGGER.exception("Unhandled synthesis failure")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        wall_seconds = time.monotonic() - request_start
+        audio_seconds = len(waveform) / sample_rate
+        LOGGER.info("OpenAI generation complete (voice=%s, format=%s) %s", voice_label, response_format, _format_rtf(audio_seconds, wall_seconds))
 
         return Response(content=payload, media_type=content_types[response_format])
 

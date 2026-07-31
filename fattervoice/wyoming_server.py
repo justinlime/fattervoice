@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from functools import partial
 from typing import Optional
 
@@ -28,6 +29,36 @@ from .service import SynthesisRequest, TtsService
 from .voice_registry import VoiceRegistry
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _format_elapsed(secs: float) -> str:
+    """Format elapsed seconds into a human-readable string."""
+    if secs < 60:
+        return f"{secs:.3f}s"
+    minutes = int(secs // 60)
+    remaining = secs % 60
+    return f"{minutes}m {remaining:.3f}s"
+
+
+def _format_rtf(audio_seconds: float, wall_seconds: float) -> str:
+    """Format Real-Time Factor with a human-readable speed clarification.
+
+    RTF = audio_duration / wall_clock_time.
+    - RTF < 1.0 means faster than real time (e.g. 0.5 = 2x real-time speed)
+    - RTF == 1.0 means exactly real time
+    - RTF > 1.0 means slower than real time (e.g. 2.0 = 0.5x real-time speed)
+    """
+    if wall_seconds <= 0:
+        return "RTF: N/A (no wall time)"
+    rtf = audio_seconds / wall_seconds
+    if rtf < 1.0:
+        speed = 1.0 / rtf
+        return f"RTF: {rtf:.3f} ({speed:.1f}x real-time speed)"
+    elif rtf > 1.0:
+        speed = 1.0 / rtf
+        return f"RTF: {rtf:.3f} ({speed:.2f}x real-time speed)"
+    return f"RTF: {rtf:.3f} (1.0x real-time speed)"
+
 
 _HARDCODED_WYOMING_AUDIO_CHUNK_SAMPLES = 4096
 _HARDCODED_WYOMING_AUDIO_CHUNK_BYTES = _HARDCODED_WYOMING_AUDIO_CHUNK_SAMPLES * 2
@@ -146,6 +177,9 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
         self._stream_voice: Optional[SynthesizeVoice] = None
         self._stream_active = False
         self._audio_started = False
+        self._request_start: float = 0.0
+        self._first_chunk_logged = False
+        self._total_audio_bytes: int = 0
 
     async def handle_event(self, event: Event) -> bool:
         """Route incoming Wyoming events to the correct synthesis workflow.
@@ -204,10 +238,17 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
             `True` to keep the connection open after the response is sent.
         """
         synthesis_request = self._build_synthesis_request(synthesize.text, synthesize.voice)
+        voice_label = synthesis_request.voice_id or "default"
+        LOGGER.info("Wyoming generation request received (voice=%s, mode=synthesize)", voice_label)
+
+        request_start = time.monotonic()
         waveform, sample_rate = await self.service.synthesize(synthesis_request)
         pcm_payload = audio_to_pcm16_bytes(waveform)
         if not pcm_payload:
             return True
+
+        first = True
+        last_chunk_time: float | None = None
 
         await self.write_event(
             AudioStart(rate=sample_rate, width=2, channels=1).event()
@@ -224,7 +265,17 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
                     channels=1,
                 ).event()
             )
+            if first:
+                elapsed = time.monotonic() - request_start
+                LOGGER.info("Wyoming synthesize first chunk sent to client (%s)", _format_elapsed(elapsed))
+                first = False
+            last_chunk_time = time.monotonic()
         await self.write_event(AudioStop().event())
+
+        if last_chunk_time is not None:
+            wall_seconds = last_chunk_time - request_start
+            audio_seconds = len(pcm_payload) / (2 * sample_rate)
+            LOGGER.info("Wyoming synthesize complete (voice=%s) %s", voice_label, _format_rtf(audio_seconds, wall_seconds))
         return True
 
     async def _handle_synthesize_start(self, synthesize_start: SynthesizeStart) -> bool:
@@ -245,6 +296,11 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
         self._stream_voice = synthesize_start.voice
         self._stream_active = True
         self._audio_started = False
+        self._request_start = time.monotonic()
+        self._first_chunk_logged = False
+        self._total_audio_bytes = 0
+        voice_label = synthesize_start.voice.name if synthesize_start.voice and synthesize_start.voice.name else "default"
+        LOGGER.info("Wyoming generation request received (voice=%s, mode=streaming)", voice_label)
         return True
 
     async def _handle_synthesize_chunk(self, synthesize_chunk: SynthesizeChunk) -> bool:
@@ -299,6 +355,10 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
 
         if self._audio_started:
             await self.write_event(AudioStop().event())
+            wall_seconds = time.monotonic() - self._request_start
+            audio_seconds = self._total_audio_bytes / (2 * self.service.sample_rate)
+            voice_label = self._stream_voice.name if self._stream_voice and self._stream_voice.name else "default"
+            LOGGER.info("Wyoming streaming complete (voice=%s) %s", voice_label, _format_rtf(audio_seconds, wall_seconds))
 
         await self.write_event(SynthesizeStopped().event())
         self._reset_stream_state()
@@ -342,7 +402,12 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
                     ).event()
                 )
                 audio_started = True
+                if not self._first_chunk_logged:
+                    elapsed = time.monotonic() - self._request_start
+                    LOGGER.info("Wyoming stream first chunk sent to client (%s)", _format_elapsed(elapsed))
+                    self._first_chunk_logged = True
 
+            self._total_audio_bytes += len(pcm_chunk)
             for chunk_payload in iter_byte_chunks(pcm_chunk, _HARDCODED_WYOMING_AUDIO_CHUNK_BYTES):
                 await self.write_event(
                     AudioChunk(
@@ -418,6 +483,9 @@ class FatterVoiceWyomingHandler(AsyncEventHandler):
         self._stream_voice = None
         self._stream_active = False
         self._audio_started = False
+        self._request_start = 0.0
+        self._first_chunk_logged = False
+        self._total_audio_bytes = 0
 
 
 

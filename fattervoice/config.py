@@ -55,8 +55,7 @@ class ServerConfig:
     layer_penalty_factor: float = 5.0
     preprocess_voice_clone_prompt: bool = True
     postprocess_output_audio: bool = True
-    audio_chunk_duration: float = 15.0
-    audio_chunk_threshold: float = 30.0
+    max_sentence_length: int = 400
     preload_voice: str | None = None
 
     @property
@@ -149,8 +148,7 @@ def format_server_config_summary(config: ServerConfig) -> str:
                 ("layer_penalty_factor", config.layer_penalty_factor),
                 ("preprocess_voice_clone_prompt", config.preprocess_voice_clone_prompt),
                 ("postprocess_output_audio", config.postprocess_output_audio),
-                ("audio_chunk_duration", config.audio_chunk_duration),
-                ("audio_chunk_threshold", config.audio_chunk_threshold),
+                ("max_sentence_length", config.max_sentence_length),
             ),
         ),
     )
@@ -332,16 +330,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Allow OmniVoice to remove excess silence and pad/fade output audio.",
     )
     parser.add_argument(
-        "--audio-chunk-duration",
-        type=float,
-        default=float(environment_default("FATTERVOICE_AUDIO_CHUNK_DURATION", "15.0")),
-        help="Target per-chunk duration in seconds for OmniVoice long-form generation.",
-    )
-    parser.add_argument(
-        "--audio-chunk-threshold",
-        type=float,
-        default=float(environment_default("FATTERVOICE_AUDIO_CHUNK_THRESHOLD", "30.0")),
-        help="Estimated duration threshold in seconds above which OmniVoice chunked long-form generation is activated.",
+        "--max-sentence-length",
+        type=int,
+        default=int(environment_default("FATTERVOICE_MAX_SENTENCE_LENGTH", "400")),
+        help="Maximum character length of a single synthesis segment before it is split further. Sentence boundaries are respected first; only segments exceeding this cap are broken on spaces. Default 400 (~25s of speech).",
     )
     parser.add_argument(
         "--wyoming-host",
@@ -401,10 +393,8 @@ def parse_server_config(argv: Sequence[str] | None = None) -> ServerConfig:
         parser.error("--class-temperature must be zero or positive.")
     if args.layer_penalty_factor < 0.0:
         parser.error("--layer-penalty-factor must be zero or positive.")
-    if args.audio_chunk_duration <= 0.0:
-        parser.error("--audio-chunk-duration must be greater than zero.")
-    if args.audio_chunk_threshold <= 0.0:
-        parser.error("--audio-chunk-threshold must be greater than zero.")
+    if args.max_sentence_length <= 0:
+        parser.error("--max-sentence-length must be greater than zero.")
     if args.wyoming_port <= 0:
         parser.error("--wyoming-port must be a positive integer.")
 
@@ -431,6 +421,5 @@ def parse_server_config(argv: Sequence[str] | None = None) -> ServerConfig:
         layer_penalty_factor=args.layer_penalty_factor,
         preprocess_voice_clone_prompt=args.preprocess_voice_clone_prompt,
         postprocess_output_audio=args.postprocess_output_audio,
-        audio_chunk_duration=args.audio_chunk_duration,
-        audio_chunk_threshold=args.audio_chunk_threshold,
+        max_sentence_length=args.max_sentence_length,
     )

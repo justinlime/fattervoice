@@ -96,8 +96,7 @@ CLI arguments take precedence, and environment variables act as fallbacks.
 | `--layer-penalty-factor` | `FATTERVOICE_LAYER_PENALTY_FACTOR` | `5.0` | Penalty that biases OmniVoice toward lower codebook layers first. Higher values can improve quality by reducing reliance on higher layers; lower values allow more layer diversity. |
 | `--preprocess-voice-clone-prompt` / `--no-preprocess-voice-clone-prompt` | `FATTERVOICE_PREPROCESS_VOICE_CLONE_PROMPT` | `true` | Preprocesses reference audio and transcript before caching the voice-clone prompt. Disable only if preprocessing causes issues with specific reference files. |
 | `--postprocess-output-audio` / `--no-postprocess-output-audio` | `FATTERVOICE_POSTPROCESS_OUTPUT_AUDIO` | `true` | Lets OmniVoice remove excess silence and apply fade-in/fade-out to output audio. Disable if you need raw unmodified model output. |
-| `--audio-chunk-duration` | `FATTERVOICE_AUDIO_CHUNK_DURATION` | `15.0` | Target duration in seconds for each internal audio chunk during long-form generation. Smaller values reduce per-chunk memory but increase chunk boundaries; larger values improve coherence at the cost of memory. |
-| `--audio-chunk-threshold` | `FATTERVOICE_AUDIO_CHUNK_THRESHOLD` | `30.0` | Estimated duration in seconds above which chunked long-form generation is activated. Requests shorter than this are synthesized as a single pass. |
+| `--max-sentence-length` | `FATTERVOICE_MAX_SENTENCE_LENGTH` | `400` | Maximum character length of a single synthesis segment. All text is split into sentence-sized segments first; only segments exceeding this cap are broken further on word boundaries. Default 400 (~25s of speech). Lower values reduce per-segment memory at the cost of more synthesis calls. |
 | `--wyoming-host` | `FATTERVOICE_WYOMING_HOST` | `0.0.0.0` | Bind address for the Wyoming TCP protocol endpoint (Home Assistant). |
 | `--wyoming-port` | `FATTERVOICE_WYOMING_PORT` | `10300` | Port for the Wyoming TCP protocol endpoint. |
 | `--log-level` | `FATTERVOICE_LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). Use `DEBUG` for troubleshooting model loading and voice resolution. |
@@ -141,12 +140,15 @@ curl http://localhost:8000/v1/audio/speech \
 
 ### Streaming behavior
 
-`wav` and `pcm` responses are still available as chunked HTTP responses, but OmniVoice currently exposes **buffered full-audio generation** rather than a documented true incremental audio streaming API. In practice that means:
+All synthesis paths split text into sentence-sized segments before calling OmniVoice, so no single generation call is unbounded in memory or time. Segments that exceed `--max-sentence-length` are broken further on word boundaries.
 
-- default chunked WAV/PCM responses still stream bytes after each full buffered OmniVoice generation call completes
-- explicit `stream=true` on WAV/PCM switches to a lower-latency sentence-segmented path that synthesizes one sentence-like segment at a time to improve time-to-first-audio for longer requests
-- Wyoming sentence-streaming still works by synthesizing completed text chunks
-- true model-incremental audio streaming is still not claimed because the backend does not currently document that capability
+In practice:
+
+- **Non-streaming** (`stream=false` or `mp3`): text is split into segments, each is synthesized sequentially, and the combined waveform is returned as one response
+- **Streaming** (`stream=true`, `wav`/`pcm`): PCM bytes are emitted as each sentence-sized segment completes, giving lower time-to-first-audio for long requests
+- **Wyoming non-streaming** (`synthesize`): same as non-streaming above — sentence-split internally, returned as one Wyoming audio sequence
+- **Wyoming streaming** (`synthesize-start` / `synthesize-chunk` / `synthesize-stop`): text arrives incrementally from the client, sentences are detected on the fly, and audio is emitted as each sentence completes
+- true model-incremental audio streaming is still not claimed because OmniVoice does not currently document that capability
 
 `mp3` is returned as a complete response because it must be encoded after generation.
 
