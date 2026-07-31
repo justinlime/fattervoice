@@ -7,7 +7,21 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 import wave
 
-_AUDIO_SUFFIXES = {".aif", ".aiff", ".au", ".flac", ".ogg", ".wav"}
+_AUDIO_SUFFIXES = {
+    ".aif",
+    ".aiff",
+    ".alac",
+    ".aac",
+    ".flac",
+    ".mp3",
+    ".ogg",
+    ".opus",
+    ".wav",
+}
+
+# Formats that libsndfile (soundfile) cannot decode on its own.
+# These fall through to a pydub + ffmpeg validation path.
+_PYDUB_SUFFIXES = {".mp3", ".opus", ".aac", ".alac"}
 _REFERENCE_TRANSCRIPT_SUFFIX = ".ref.txt"
 _INSTRUCT_TEXT_SUFFIX = ".instruct.txt"
 
@@ -315,6 +329,11 @@ def validate_audio_file(audio_path: Path) -> None:
         except wave.Error as exc:
             raise VoiceRegistryError(f"Unreadable WAV file {audio_path}: {exc}") from exc
 
+    # Formats that libsndfile cannot decode fall back to pydub + ffmpeg.
+    if suffix in _PYDUB_SUFFIXES:
+        _validate_with_pydub(audio_path)
+        return
+
     try:
         import soundfile as sf
     except ImportError as exc:
@@ -329,4 +348,36 @@ def validate_audio_file(audio_path: Path) -> None:
         raise VoiceRegistryError(f"Unreadable audio file {audio_path}: {exc}") from exc
 
     if info.frames <= 0:
+        raise VoiceRegistryError(f"Audio file has no samples: {audio_path}")
+
+
+def _validate_with_pydub(audio_path: Path) -> None:
+    """Validate a reference audio file via pydub + ffmpeg.
+
+    Usage:
+        ``validate_audio_file`` delegates here for formats that libsndfile
+        cannot decode on its own (mp3, opus, aac, alac). pydub uses ffmpeg
+        under the hood so ffmpeg must be available on ``PATH``.
+
+    Parameters:
+        audio_path: The audio file path that should be inspected.
+
+    Raises:
+        VoiceRegistryError: If pydub or ffmpeg is missing, or the file is
+            unreadable or contains no audio frames.
+    """
+    try:
+        from pydub import AudioSegment
+    except ImportError as exc:
+        raise VoiceRegistryError(
+            f"pydub is required to validate {audio_path.suffix} reference audio files. "
+            f"Unable to validate {audio_path}."
+        ) from exc
+
+    try:
+        audio = AudioSegment.from_file(str(audio_path))
+    except Exception as exc:
+        raise VoiceRegistryError(f"Unreadable audio file {audio_path}: {exc}") from exc
+
+    if len(audio) == 0:
         raise VoiceRegistryError(f"Audio file has no samples: {audio_path}")

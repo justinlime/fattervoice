@@ -57,6 +57,7 @@ class ServerConfig:
     postprocess_output_audio: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    preload_voice: str | None = None
 
     @property
     def wyoming_uri(self) -> str:
@@ -129,6 +130,7 @@ def format_server_config_summary(config: ServerConfig) -> str:
             "Runtime",
             (
                 ("Voices directory", config.voices_dir),
+                ("Preload voice", config.preload_voice or "(none)"),
                 ("Device", config.device),
                 ("Dtype", config.dtype),
                 ("Log level", config.log_level),
@@ -353,6 +355,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Wyoming TCP bind port.",
     )
     parser.add_argument(
+        "--preload-voice",
+        default=environment_default("FATTERVOICE_PRELOAD_VOICE", ""),
+        help="Voice ID to pre-load its clone prompt at startup (e.g. hank).",
+    )
+    parser.add_argument(
         "--log-level",
         default=environment_default("FATTERVOICE_LOG_LEVEL", "INFO"),
         help="Python logging level.",
@@ -401,6 +408,9 @@ def parse_server_config(argv: Sequence[str] | None = None) -> ServerConfig:
     if args.wyoming_port <= 0:
         parser.error("--wyoming-port must be a positive integer.")
 
+    preload_voice_raw = args.preload_voice.strip() if args.preload_voice else ""
+    preload_voice = preload_voice_raw if preload_voice_raw else None
+
     return ServerConfig(
         voices_dir=Path(args.voices_dir).expanduser().resolve(),
         openapi_host=args.openapi_host,
@@ -411,6 +421,7 @@ def parse_server_config(argv: Sequence[str] | None = None) -> ServerConfig:
         wyoming_host=args.wyoming_host,
         wyoming_port=args.wyoming_port,
         log_level=args.log_level.upper(),
+        preload_voice=preload_voice,
         num_step=args.num_step,
         guidance_scale=args.guidance_scale,
         denoise=args.denoise,

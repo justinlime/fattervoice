@@ -556,14 +556,14 @@ class TtsServiceTests(unittest.TestCase):
         )
 
     def test_synthesize_releases_unused_accelerator_memory_when_switching_voices(self) -> None:
-        """Ensure voice changes trigger best-effort accelerator cache cleanup.
+        """Ensure accelerator cache cleanup runs after prompt creation and generation.
 
         Usage:
-            Large reference prompts can leave the CUDA caching allocator holding
-            onto a previous voice's high-water mark. This regression test
-            verifies that the service runs its cleanup hook when generation
-            switches to a different voice, while avoiding extra cleanup for
-            repeated requests to the same voice.
+            Large reference prompts and generation intermediates can leave the CUDA
+            caching allocator holding onto GPU memory. This regression test verifies
+            that the service runs its cleanup hook after voice-clone prompt creation
+            (moving GPU tensors to CPU) and after each generation call (freeing
+            intermediate tensors), keeping VRAM close to the model's baseline usage.
 
         Parameters:
             None.
@@ -571,6 +571,12 @@ class TtsServiceTests(unittest.TestCase):
         Returns:
             None. The test asserts on cleanup-hook call counts across repeated
             same-voice and cross-voice requests.
+
+            Expected calls (3 requests, 2 unique voices):
+            - Request 1 (demo, first use): prompt creation (1) + post-generation (1) = 2
+            - Request 2 (demo, cached): post-generation (1) = 1
+            - Request 3 (other, first use): prompt creation (1) + voice-switch (1) + post-generation (1) = 3
+            - Total: 6
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_model = FakeOmniVoiceModel()
@@ -593,7 +599,7 @@ class TtsServiceTests(unittest.TestCase):
 
                 asyncio.run(run_test())
 
-        self.assertEqual(release_memory.call_count, 1)
+        self.assertEqual(release_memory.call_count, 6)
 
     def test_close_clears_cached_prompts_and_releases_unused_accelerator_memory(self) -> None:
         """Ensure service shutdown clears cached prompts and runs cleanup once.

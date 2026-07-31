@@ -277,7 +277,8 @@ class TtsService:
             Call this exactly once during process startup before either server
             adapter begins accepting requests. Voice-clone prompts are built
             lazily on first use so large voice directories do not eagerly occupy
-            CPU or GPU memory at startup.
+            CPU or GPU memory at startup, unless a specific voice is configured
+            for pre-loading via ``--preload-voice`` / ``FATTERVOICE_PRELOAD_VOICE``.
 
         Parameters:
             None.
@@ -287,6 +288,15 @@ class TtsService:
         """
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._load_model)
+
+        if self.config.preload_voice:
+            voice = self.voice_registry.get(self.config.preload_voice)
+            await loop.run_in_executor(
+                None, lambda: self._resolve_cached_voice_clone_prompt(voice)
+            )
+            LOGGER.info(
+                "Pre-loaded voice clone prompt for voice %s", self.config.preload_voice
+            )
 
     def validate_request(self, request: SynthesisRequest) -> VoiceEntry:
         """Validate request text and resolve the referenced voice before synthesis.

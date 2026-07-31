@@ -40,6 +40,21 @@ When `<voice>.instruct.txt` is present, its stripped text is forwarded to OmniVo
 
 Because `fattervoice` requires reference transcripts for every voice, OmniVoice auto-ASR is intentionally **not** part of the normal server flow. This keeps voice cloning faster, more stable, and easier to run offline.
 
+### Supported audio formats
+
+| Format | Extension(s) | Decoder |
+| --- | --- | --- |
+| WAV | `.wav` | stdlib `wave` |
+| AIFF | `.aif`, `.aiff` | `soundfile` (libsndfile) |
+| FLAC | `.flac` | `soundfile` (libsndfile) |
+| Ogg Vorbis | `.ogg` | `soundfile` (libsndfile) |
+| MP3 | `.mp3` | `pydub` + `ffmpeg` |
+| Opus | `.opus` | `pydub` + `ffmpeg` |
+| AAC | `.aac` | `pydub` + `ffmpeg` |
+| ALAC | `.alac` | `pydub` + `ffmpeg` |
+
+All formats are validated at startup so broken or unreadable reference files fail fast before any traffic is served. Formats decoded through `pydub` require `ffmpeg` on `PATH` (included in the official Docker image).
+
 ## Local development with `uv`
 
 Install dependencies:
@@ -63,28 +78,29 @@ CLI arguments take precedence, and environment variables act as fallbacks.
 
 ### Server configuration reference
 
-| CLI flag | ENV fallback | Default |
-| --- | --- | --- |
-| `--voices-dir` | `FATTERVOICE_VOICES_DIR` | `voices` |
-| `--openapi-host` | `FATTERVOICE_OPENAPI_HOST` | `0.0.0.0` |
-| `--openapi-port` | `FATTERVOICE_OPENAPI_PORT` | `8000` |
-| `--device` | `FATTERVOICE_DEVICE` | `cuda:0` |
-| `--dtype` | `FATTERVOICE_DTYPE` | `bfloat16` |
-| `--default-language` | `FATTERVOICE_DEFAULT_LANGUAGE` | `auto` |
-| `--num-step` | `FATTERVOICE_NUM_STEP` | `32` |
-| `--guidance-scale` | `FATTERVOICE_GUIDANCE_SCALE` | `2.0` |
-| `--denoise` / `--no-denoise` | `FATTERVOICE_DENOISE` | `true` |
-| `--t-shift` | `FATTERVOICE_T_SHIFT` | `0.1` |
-| `--position-temperature` | `FATTERVOICE_POSITION_TEMPERATURE` | `5.0` |
-| `--class-temperature` | `FATTERVOICE_CLASS_TEMPERATURE` | `0.0` |
-| `--layer-penalty-factor` | `FATTERVOICE_LAYER_PENALTY_FACTOR` | `5.0` |
-| `--preprocess-voice-clone-prompt` / `--no-preprocess-voice-clone-prompt` | `FATTERVOICE_PREPROCESS_VOICE_CLONE_PROMPT` | `true` |
-| `--postprocess-output-audio` / `--no-postprocess-output-audio` | `FATTERVOICE_POSTPROCESS_OUTPUT_AUDIO` | `true` |
-| `--audio-chunk-duration` | `FATTERVOICE_AUDIO_CHUNK_DURATION` | `15.0` |
-| `--audio-chunk-threshold` | `FATTERVOICE_AUDIO_CHUNK_THRESHOLD` | `30.0` |
-| `--wyoming-host` | `FATTERVOICE_WYOMING_HOST` | `0.0.0.0` |
-| `--wyoming-port` | `FATTERVOICE_WYOMING_PORT` | `10300` |
-| `--log-level` | `FATTERVOICE_LOG_LEVEL` | `INFO` |
+| CLI flag | ENV fallback | Default | Description |
+| --- | --- | --- | --- |
+| `--voices-dir` | `FATTERVOICE_VOICES_DIR` | `voices` | Directory containing `<voice>.<audio>` + `<voice>.ref.txt` pairs. Change when your voice files live outside the project root (e.g. a Docker volume mount). |
+| `--preload-voice` | `FATTERVOICE_PRELOAD_VOICE` | *(none)* | Voice ID whose clone prompt should be built at startup instead of lazily on first request. The value must match a voice basename in `--voices-dir` (e.g. `hank` for `hank.wav` + `hank.ref.txt`). Useful when a single voice handles most traffic and you want to avoid the first-request cold-start penalty. |
+| `--openapi-host` | `FATTERVOICE_OPENAPI_HOST` | `0.0.0.0` | Bind address for the OpenAI-compatible HTTP server. |
+| `--openapi-port` | `FATTERVOICE_OPENAPI_PORT` | `8000` | Port for the OpenAI-compatible HTTP server. |
+| `--device` | `FATTERVOICE_DEVICE` | `cuda:0` | Torch device passed to OmniVoice (e.g. `cuda:0`, `cpu`, `mps`). Use `cpu` only for debugging — GPU is required for practical latency. |
+| `--dtype` | `FATTERVOICE_DTYPE` | `bfloat16` | Torch precision (`float16`, `bfloat16`, `float32`). `bfloat16` is the default balanced setting; `float16` saves VRAM but can reduce quality on some models; `float32` maximizes quality at the cost of speed and memory. |
+| `--default-language` | `FATTERVOICE_DEFAULT_LANGUAGE` | `auto` | Fallback language when the client does not specify one. `auto` lets OmniVoice detect the language from the input text. Set to a concrete code (e.g. `en`, `zh`) to force a specific language. |
+| `--num-step` | `FATTERVOICE_NUM_STEP` | `32` | OmniVoice diffusion decoding steps. Lower values are faster but can reduce quality; `16` is the practical minimum, `32` is the default balanced setting. |
+| `--guidance-scale` | `FATTERVOICE_GUIDANCE_SCALE` | `2.0` | Classifier-free guidance scale. Higher values push output closer to the text prompt but can introduce artifacts; lower values produce more natural but less controlled speech. |
+| `--denoise` / `--no-denoise` | `FATTERVOICE_DENOISE` | `true` | Enables denoise prompting for cleaner output. Disable only if you notice unwanted artifacts and want raw model output. |
+| `--t-shift` | `FATTERVOICE_T_SHIFT` | `0.1` | Diffusion time-shift parameter. Adjust only if tuning diffusion scheduling for specific quality/latency trade-offs. |
+| `--position-temperature` | `FATTERVOICE_POSITION_TEMPERATURE` | `5.0` | Position-sampling temperature. Higher values increase variation in prosody; lower values produce more consistent but potentially monotonous speech. |
+| `--class-temperature` | `FATTERVOICE_CLASS_TEMPERATURE` | `0.0` | Class-sampling temperature. Non-zero values add stochasticity to phoneme-level choices; `0.0` (default) is deterministic. |
+| `--layer-penalty-factor` | `FATTERVOICE_LAYER_PENALTY_FACTOR` | `5.0` | Penalty that biases OmniVoice toward lower codebook layers first. Higher values can improve quality by reducing reliance on higher layers; lower values allow more layer diversity. |
+| `--preprocess-voice-clone-prompt` / `--no-preprocess-voice-clone-prompt` | `FATTERVOICE_PREPROCESS_VOICE_CLONE_PROMPT` | `true` | Preprocesses reference audio and transcript before caching the voice-clone prompt. Disable only if preprocessing causes issues with specific reference files. |
+| `--postprocess-output-audio` / `--no-postprocess-output-audio` | `FATTERVOICE_POSTPROCESS_OUTPUT_AUDIO` | `true` | Lets OmniVoice remove excess silence and apply fade-in/fade-out to output audio. Disable if you need raw unmodified model output. |
+| `--audio-chunk-duration` | `FATTERVOICE_AUDIO_CHUNK_DURATION` | `15.0` | Target duration in seconds for each internal audio chunk during long-form generation. Smaller values reduce per-chunk memory but increase chunk boundaries; larger values improve coherence at the cost of memory. |
+| `--audio-chunk-threshold` | `FATTERVOICE_AUDIO_CHUNK_THRESHOLD` | `30.0` | Estimated duration in seconds above which chunked long-form generation is activated. Requests shorter than this are synthesized as a single pass. |
+| `--wyoming-host` | `FATTERVOICE_WYOMING_HOST` | `0.0.0.0` | Bind address for the Wyoming TCP protocol endpoint (Home Assistant). |
+| `--wyoming-port` | `FATTERVOICE_WYOMING_PORT` | `10300` | Port for the Wyoming TCP protocol endpoint. |
+| `--log-level` | `FATTERVOICE_LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). Use `DEBUG` for troubleshooting model loading and voice resolution. |
 
 Boolean environment variables accept `1`, `true`, `yes`, or `on` for true, and `0`, `false`, `no`, or `off` for false.
 
