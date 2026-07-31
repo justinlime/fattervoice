@@ -7,6 +7,7 @@ import gc
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -339,6 +340,10 @@ class TtsService:
             CPU or GPU memory at startup, unless a specific voice is configured
             for pre-loading via ``--preload-voice`` / ``FATTERVOICE_PRELOAD_VOICE``.
 
+            After the model and optional preload voice are ready, a short warmup
+            synthesis is performed to pre-compile CUDA kernels and initialize
+            lazy internal state so the first real request is not penalized.
+
         Parameters:
             None.
 
@@ -356,6 +361,50 @@ class TtsService:
             LOGGER.info(
                 "Pre-loaded voice clone prompt for voice %s", self.config.preload_voice
             )
+
+        await self._warmup(loop)
+
+    async def _warmup(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Run a short synthesis to pre-compile CUDA kernels and warm internal caches.
+
+        Usage:
+            Startup calls this after the model is loaded so the first real
+            request benefits from already-compiled kernels and initialized
+            memory pools rather than paying the one-time compilation cost.
+
+        Parameters:
+            loop: The running asyncio event loop for executor dispatch.
+        """
+        voice = self._pick_warmup_voice()
+        if voice is None:
+            LOGGER.info("Skipping warmup synthesis (no voices available)")
+            return
+
+        LOGGER.info("Running warmup synthesis for voice %s", voice.voice_id)
+        warmup_request = SynthesisRequest(
+            text="This is a warmup phrase to pre-compile kernels.",
+            voice_id=voice.voice_id,
+        )
+
+        start_time = time.monotonic()
+        await loop.run_in_executor(
+            None, lambda: self._generate_waveform(warmup_request, voice)
+        )
+        elapsed = time.monotonic() - start_time
+        LOGGER.info("Warmup synthesis complete in %.2fs", elapsed)
+
+    def _pick_warmup_voice(self) -> VoiceEntry | None:
+        """Pick a voice to use for the warmup synthesis.
+
+        Returns the preloaded voice if configured, otherwise the first voice
+        in the registry, or None if the registry is empty.
+        """
+        if self.config.preload_voice:
+            return self.voice_registry.get(self.config.preload_voice)
+        voice_ids = self.voice_registry.list_voice_ids()
+        if voice_ids:
+            return self.voice_registry.get(voice_ids[0])
+        return None
 
     def validate_request(self, request: SynthesisRequest) -> VoiceEntry:
         """Validate request text and resolve the referenced voice before synthesis.
