@@ -56,6 +56,7 @@ class ServerConfig:
     preprocess_voice_clone_prompt: bool = True
     postprocess_output_audio: bool = True
     max_sentence_length: int = 400
+    break_point_lookback: int = 100
     preload_voice: str | None = None
 
     @property
@@ -337,6 +338,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Maximum character length of a single synthesis segment before it is split further. Sentence boundaries are respected first; only segments exceeding this cap are broken on spaces. Default 400 (~25s of speech).",
     )
     parser.add_argument(
+        "--break-point-lookback",
+        type=int,
+        default=int(environment_default("FATTERVOICE_BREAKPOINT_WINDOW", "100")),
+        help="Number of characters before the max sentence length to search for a natural break point (comma, conjunction, etc.). If no suitable break is found in this window, a hard word-boundary split is used. Default 100. Increase this if you raise --max-sentence-length to avoid breaks in unsuitable locations.",
+    )
+    parser.add_argument(
         "--wyoming-host",
         default=environment_default("FATTERVOICE_WYOMING_HOST", "0.0.0.0"),
         help="Wyoming TCP bind host.",
@@ -396,6 +403,8 @@ def parse_server_config(argv: Sequence[str] | None = None) -> ServerConfig:
         parser.error("--layer-penalty-factor must be zero or positive.")
     if args.max_sentence_length <= 0:
         parser.error("--max-sentence-length must be greater than zero.")
+    if args.break_point_lookback <= 0:
+        parser.error("--break-point-lookback must be greater than zero.")
     if args.wyoming_port <= 0:
         parser.error("--wyoming-port must be a positive integer.")
 
@@ -423,4 +432,5 @@ def parse_server_config(argv: Sequence[str] | None = None) -> ServerConfig:
         preprocess_voice_clone_prompt=args.preprocess_voice_clone_prompt,
         postprocess_output_audio=args.postprocess_output_audio,
         max_sentence_length=args.max_sentence_length,
+        break_point_lookback=args.break_point_lookback,
     )

@@ -173,7 +173,7 @@ def coerce_waveform_array(waveform: Any) -> np.ndarray:
 
 
 
-def split_text_for_streaming(text: str, max_length: int = 400) -> list[str]:
+def split_text_for_streaming(text: str, max_length: int = 400, break_point_lookback: int = 100) -> list[str]:
     """Split request text into sentence-first synthesis segments with a length cap.
 
     Usage:
@@ -215,11 +215,11 @@ def split_text_for_streaming(text: str, max_length: int = 400) -> list[str]:
         if len(segment) <= effective_max:
             capped.append(segment)
         else:
-            capped.extend(_split_segment_on_words(segment, effective_max))
+            capped.extend(_split_segment_on_words(segment, effective_max, break_point_lookback))
     return capped
 
 
-def _split_segment_on_words(segment: str, max_length: int) -> list[str]:
+def _split_segment_on_words(segment: str, max_length: int, break_point_lookback: int = 100) -> list[str]:
     """Break an oversized segment into smaller chunks, preferring natural pause points.
 
     Usage:
@@ -259,7 +259,7 @@ def _split_segment_on_words(segment: str, max_length: int) -> list[str]:
         " meanwhile, ",
         " furthermore, ",
     )
-    _LOOKBACK_WINDOW = 100  # characters to scan before max_length for a break point
+    _LOOKBACK_WINDOW = break_point_lookback  # characters to scan before max_length for a break point
 
     def _find_break_in_window(text: str, limit: int) -> int | None:
         """Find the best natural break point in the last _LOOKBACK_WINDOW chars before ``limit``.
@@ -522,7 +522,9 @@ class TtsService:
             float32 NumPy array containing all synthesized segments concatenated.
         """
         voice = self.validate_request(request)
-        segments = split_text_for_streaming(request.text, self.config.max_sentence_length)
+        segments = split_text_for_streaming(
+            request.text, self.config.max_sentence_length, self.config.break_point_lookback
+        )
         loop = asyncio.get_running_loop()
         waveforms: list[np.ndarray] = []
         for i, segment_text in enumerate(segments):
@@ -556,7 +558,9 @@ class TtsService:
             synthesis segment completes.
         """
         resolved_voice = self.validate_request(request)
-        segments = split_text_for_streaming(request.text, self.config.max_sentence_length)
+        segments = split_text_for_streaming(
+            request.text, self.config.max_sentence_length, self.config.break_point_lookback
+        )
 
         async def emit_pcm_chunks() -> AsyncIterator[bytes]:
             """Synthesize segments sequentially and yield PCM chunks.
