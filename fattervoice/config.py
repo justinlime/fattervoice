@@ -56,7 +56,6 @@ class ServerConfig:
     preprocess_voice_clone_prompt: bool = True
     postprocess_output_audio: bool = True
     max_sentence_length: int = 400
-    break_point_lookback: int = 100
     preload_voice: str | None = None
 
     @property
@@ -150,6 +149,7 @@ def format_server_config_summary(config: ServerConfig) -> str:
                 ("preprocess_voice_clone_prompt", config.preprocess_voice_clone_prompt),
                 ("postprocess_output_audio", config.postprocess_output_audio),
                 ("max_sentence_length", config.max_sentence_length),
+                ("break_point_lookback", config.break_point_lookback),
             ),
         ),
     )
