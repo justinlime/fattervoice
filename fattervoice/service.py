@@ -206,60 +206,138 @@ def split_text_for_streaming(text: str, max_length: int = 400) -> list[str]:
     if not raw_segments:
         return [text.strip()]
 
+    # Enforce a minimum of 100 characters so segments stay pronounceable
+    # and the break-point lookback window has room to operate.
+    effective_max = max(max_length, 100)
+
     capped: list[str] = []
     for segment in raw_segments:
-        if len(segment) <= max_length:
+        if len(segment) <= effective_max:
             capped.append(segment)
         else:
-            capped.extend(_split_segment_on_words(segment, max_length))
+            capped.extend(_split_segment_on_words(segment, effective_max))
     return capped
 
 
 def _split_segment_on_words(segment: str, max_length: int) -> list[str]:
-    """Break an oversized segment into smaller chunks on word boundaries.
+    """Break an oversized segment into smaller chunks, preferring natural pause points.
 
     Usage:
         ``split_text_for_streaming`` calls this helper when a single sentence
         exceeds the configured character cap so it can still be synthesized
-        in manageable pieces without breaking words mid-character.
+        in manageable pieces. The algorithm searches for a natural break point
+        (comma, conjunction, etc.) within the **last 100 characters before
+        ``max_length``** is reached. If one is found, the segment splits there
+        (still within the limit). If none exists in that lookback window, it
+        falls back to a hard word-boundary split at ``max_length`` so the
+        limit is never exceeded.
 
     Parameters:
         segment: A stripped text segment that is longer than ``max_length``.
-        max_length: The maximum character count for each produced chunk.
+        max_length: The hard maximum character count for each produced chunk.
 
     Returns:
         An ordered list of stripped sub-segments, each at most ``max_length``
         characters long.
     """
-    words = segment.split()
+    # Natural break markers ordered by preference (earlier = preferred on tie).
+    # Commas give the shortest natural pause; conjunctions give clause boundaries.
+    _PREFERRED_BREAKS: tuple[str, ...] = (
+        ", ",
+        "; ",
+        ". ",
+        " but ",
+        " and ",
+        " because ",
+        " so ",
+        " yet ",
+        " or ",
+        " while ",
+        " although ",
+        " however, ",
+        " therefore, ",
+        " meanwhile, ",
+        " furthermore, ",
+    )
+    _LOOKBACK_WINDOW = 100  # characters to scan before max_length for a break point
+
+    def _find_break_in_window(text: str, limit: int) -> int | None:
+        """Find the best natural break point in the last _LOOKBACK_WINDOW chars before ``limit``.
+
+        Returns the character position to split at (after the break marker),
+        or ``None`` if no preferred break exists in the window.
+        """
+        window_start = max(0, limit - _LOOKBACK_WINDOW)
+        best_split: int | None = None
+        best_marker_idx: int = len(_PREFERRED_BREAKS)
+
+        for marker_idx, break_marker in enumerate(_PREFERRED_BREAKS):
+            pos = 0
+            while True:
+                pos = text.find(break_marker, pos)
+                if pos == -1:
+                    break
+                split_after = pos + len(break_marker)
+                # Must be inside the lookback window [window_start, limit]
+                if window_start <= split_after <= limit:
+                    if (best_split is None
+                            or split_after > best_split
+                            or (split_after == best_split and marker_idx < best_marker_idx)):
+                        best_split = split_after
+                        best_marker_idx = marker_idx
+                pos += 1
+
+        return best_split
+
     chunks: list[str] = []
+    words = segment.split()
     current: list[str] = []
     current_len = 0
 
     for word in words:
         word_len = len(word)
-        # If a single word exceeds the cap, force-split it
+        added_len = word_len + (1 if current else 0)  # +1 for the space
+
+        # Force-split a single word that exceeds the hard limit
         if word_len > max_length:
             if current:
                 chunks.append(" ".join(current))
                 current = []
                 current_len = 0
-            # Hard-split the oversized word
             for i in range(0, word_len, max_length):
                 chunks.append(word[i : i + max_length])
             continue
 
-        if current_len + (1 if current else 0) + word_len > max_length:
-            chunks.append(" ".join(current))
-            current = [word]
-            current_len = word_len
+        if current_len + added_len > max_length:
+            # We've exceeded the limit — try to find a break point in the
+            # lookback window of the text accumulated so far.
+            accumulated = " ".join(current)
+            split_at = _find_break_in_window(accumulated, max_length)
+
+            if split_at is not None:
+                # Split at the natural break point (guaranteed <= max_length)
+                chunks.append(accumulated[:split_at].rstrip())
+                # Remaining words: everything after the break + current word
+                leftover_words = accumulated[split_at:].split()
+                current = leftover_words + [word]
+                current_len = sum(len(w) for w in leftover_words) + word_len
+                if len(leftover_words) > 1:
+                    current_len += len(leftover_words) - 1  # spaces
+                elif leftover_words:
+                    current_len += 1  # space between leftover and word
+            else:
+                # No break point in window — emit what we have, start fresh
+                chunks.append(" ".join(current))
+                current = [word]
+                current_len = word_len
         else:
             current.append(word)
-            current_len += (1 if len(current) > 1 else 0) + word_len
+            current_len += added_len
 
     if current:
         chunks.append(" ".join(current))
-    return chunks
+
+    return [chunk for chunk in chunks if chunk]
 
 
 class TtsService:
@@ -528,42 +606,6 @@ class TtsService:
             An async iterator that yields raw 16-bit PCM audio chunks.
         """
         return self.stream_pcm_chunks(request)
-        resolved_voice = self.validate_request(request)
-        streaming_segments = split_text_for_streaming(request.text)
-
-        async def emit_low_latency_pcm_chunks() -> AsyncIterator[bytes]:
-            """Generate sentence-sized waveform segments and yield them as PCM chunks.
-
-            Usage:
-                The outer method performs eager validation and segment planning so
-                the nested generator can focus on sequential segment synthesis and
-                byte emission once the HTTP response body has started.
-
-            Parameters:
-                None. It closes over the validated request and resolved voice.
-
-            Returns:
-                An async iterator that yields fixed-size PCM byte chunks from each
-                synthesized text segment in order.
-            """
-            loop = asyncio.get_running_loop()
-            for segment_text in streaming_segments:
-                segment_request = SynthesisRequest(
-                    text=segment_text,
-                    voice_id=resolved_voice.voice_id,
-                    language=request.language,
-                    speed=request.speed,
-                )
-                waveform, sample_rate = await loop.run_in_executor(
-                    None,
-                    lambda: self._generate_waveform(segment_request, resolved_voice),
-                )
-                _ = sample_rate
-                pcm_payload = audio_to_pcm16_bytes(waveform)
-                for pcm_chunk in iter_byte_chunks(pcm_payload, _STREAMING_PCM_CHUNK_BYTES):
-                    yield pcm_chunk
-
-        return emit_low_latency_pcm_chunks()
 
     def _load_model(self) -> None:
         """Load the OmniVoice model using the configured device and dtype.
